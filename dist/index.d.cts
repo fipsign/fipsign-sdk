@@ -6,33 +6,21 @@
  *
  * @example
  * import { PQAuth } from 'pqauth-sdk'
- *
  * const pqauth = new PQAuth('pqa_your_api_key')
  *
- * // Sign a token
- * const { token } = await pqauth.sign({ sub: 'user_123', email: 'user@app.com' })
- *
- * // Verify a token
+ * const { token } = await pqauth.sign({ sub: 'user_123' })
  * const { valid, payload } = await pqauth.verify(token)
  */
 interface PQAuthOptions {
-    /** Your PQAuth API key (starts with pqa_) */
     apiKey: string;
-    /** API base URL. Defaults to the PQAuth cloud service. */
     baseUrl?: string;
-    /** Request timeout in milliseconds. Default: 10000 */
     timeout?: number;
 }
 interface SignOptions {
-    /** Subject — userId or email that identifies the end user */
     sub: string;
-    /** Optional email of the end user */
     email?: string;
-    /** Optional role (e.g. 'admin', 'user', 'merchant') */
     role?: string;
-    /** Token expiry in seconds. Default: 3600 (1 hour) */
     expiresInSeconds?: number;
-    /** Any additional custom fields */
     [key: string]: unknown;
 }
 interface PQToken {
@@ -50,6 +38,12 @@ interface SignResult {
         expiresIn: number;
         issuedFor: string;
     };
+    usage: {
+        count: number;
+        limit: number;
+        remaining: number;
+        month: string;
+    };
 }
 interface VerifyResult {
     valid: boolean;
@@ -64,17 +58,43 @@ interface TokenPayload {
     exp: number;
     [key: string]: unknown;
 }
+interface RevokeResult {
+    success: boolean;
+    message: string;
+    revokedAt: number;
+    sub: string;
+}
+interface UsageResult {
+    current: {
+        count: number;
+        month: string;
+        limit: number;
+        remaining: number;
+        plan: string;
+    };
+    history: {
+        month: string;
+        count: number;
+    }[];
+    developer: {
+        email: string;
+        plan: string;
+    };
+}
+type WebhookEvent = 'token.signed' | 'token.rejected' | 'token.revoked' | 'limit.warning' | 'limit.reached';
+interface WebhookResult {
+    webhook: {
+        url: string;
+        events: WebhookEvent[];
+        secret: string;
+    };
+}
 interface HealthResult {
     status: string;
     algorithm: string;
     standard: string;
     quantumResistant: boolean;
     version: string;
-}
-declare class PQAuthError extends Error {
-    readonly code: string;
-    readonly status?: number | undefined;
-    constructor(message: string, code: string, status?: number | undefined);
 }
 interface MiddlewareRequest {
     headers: {
@@ -86,6 +106,11 @@ interface MiddlewareResponse {
     json: (data: unknown) => void;
 }
 type NextFunction = (err?: unknown) => void;
+declare class PQAuthError extends Error {
+    readonly code: string;
+    readonly status?: number | undefined;
+    constructor(message: string, code: string, status?: number | undefined);
+}
 declare class PQAuth {
     private readonly apiKey;
     private readonly baseUrl;
@@ -94,51 +119,78 @@ declare class PQAuth {
     private request;
     /**
      * Sign a token for an authenticated user.
-     * Call this after verifying the user's credentials in your own system.
      *
      * @example
-     * const { token } = await pqauth.sign({
-     *   sub: user.id,
-     *   email: user.email,
-     *   role: 'admin',
-     *   expiresInSeconds: 3600
-     * })
+     * const { token } = await pqauth.sign({ sub: user.id, email: user.email })
      */
     sign(options: SignOptions): Promise<SignResult>;
     /**
      * Verify a PQAuth token.
-     * Returns { valid: true, payload } if valid, or { valid: false, error } if not.
-     * Never throws — safe to use in middleware.
+     * Never throws — returns { valid: false, error } on failure.
      *
      * @example
      * const { valid, payload } = await pqauth.verify(token)
      * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
-     * console.log(payload.sub) // user id
      */
     verify(token: PQToken): Promise<VerifyResult>;
     /**
+     * Revoke a token immediately.
+     * Once revoked, the token will be rejected on any future verify() call.
+     *
+     * @example
+     * // Revoke on logout or when a session is compromised
+     * await pqauth.revoke(token, 'user logged out')
+     */
+    revoke(token: PQToken, reason?: string): Promise<RevokeResult>;
+    /**
+     * Get current month usage and 6-month history.
+     *
+     * @example
+     * const { current } = await pqauth.usage()
+     * console.log(`${current.count} / ${current.limit} tokens used`)
+     */
+    usage(): Promise<UsageResult>;
+    /**
+     * Register a webhook URL to receive event notifications.
+     *
+     * @example
+     * const { webhook } = await pqauth.webhooks.register({
+     *   url: 'https://myapp.com/webhooks/pqauth',
+     *   events: ['limit.warning', 'limit.reached', 'token.revoked']
+     * })
+     * console.log(webhook.secret) // store this to verify incoming webhooks
+     */
+    readonly webhooks: {
+        register: (options: {
+            url: string;
+            events?: WebhookEvent[];
+        }) => Promise<WebhookResult>;
+        get: () => Promise<{
+            webhook: WebhookResult["webhook"] | null;
+        }>;
+        delete: () => Promise<{
+            success: boolean;
+        }>;
+        test: () => Promise<{
+            success: boolean;
+            message: string;
+        }>;
+    };
+    /**
      * Express / Fastify middleware.
-     * Reads the token from the Authorization header (Bearer token).
+     * Reads the token from the Authorization: Bearer header.
      * Attaches payload to req.user if valid.
      *
      * @example
-     * // Express
      * app.use('/api', pqauth.middleware())
-     *
-     * // Fastify
-     * fastify.addHook('preHandler', pqauth.middleware())
      */
     middleware(): (req: MiddlewareRequest & {
         user?: TokenPayload;
     }, res: MiddlewareResponse, next: NextFunction) => Promise<void>;
     /**
      * Check the PQAuth service status.
-     *
-     * @example
-     * const health = await pqauth.health()
-     * console.log(health.quantumResistant) // true
      */
     health(): Promise<HealthResult>;
 }
 
-export { type HealthResult, type MiddlewareRequest, type MiddlewareResponse, type NextFunction, PQAuth, PQAuthError, type PQAuthOptions, type PQToken, type SignOptions, type SignResult, type TokenPayload, type VerifyResult, PQAuth as default };
+export { type HealthResult, type MiddlewareRequest, type MiddlewareResponse, type NextFunction, PQAuth, PQAuthError, type PQAuthOptions, type PQToken, type RevokeResult, type SignOptions, type SignResult, type TokenPayload, type UsageResult, type VerifyResult, type WebhookEvent, type WebhookResult, PQAuth as default };

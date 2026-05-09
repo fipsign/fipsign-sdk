@@ -9,6 +9,26 @@ var PQAuthError = class extends Error {
 };
 var PQAuth = class {
   constructor(options) {
+    // ── webhooks ────────────────────────────────────────────────────────────────
+    /**
+     * Register a webhook URL to receive event notifications.
+     *
+     * @example
+     * const { webhook } = await pqauth.webhooks.register({
+     *   url: 'https://myapp.com/webhooks/pqauth',
+     *   events: ['limit.warning', 'limit.reached', 'token.revoked']
+     * })
+     * console.log(webhook.secret) // store this to verify incoming webhooks
+     */
+    this.webhooks = {
+      register: (options) => this.request("/webhooks", {
+        method: "POST",
+        body: JSON.stringify(options)
+      }),
+      get: () => this.request("/webhooks"),
+      delete: () => this.request("/webhooks", { method: "DELETE" }),
+      test: () => this.request("/webhooks/test", { method: "POST" })
+    };
     if (typeof options === "string") {
       this.apiKey = options;
       this.baseUrl = "https://pqauth-core.gdbok.workers.dev";
@@ -18,14 +38,14 @@ var PQAuth = class {
       this.baseUrl = options.baseUrl ?? "https://pqauth-core.gdbok.workers.dev";
       this.timeout = options.timeout ?? 1e4;
     }
-    if (!this.apiKey || !this.apiKey.startsWith("pqa_")) {
+    if (!this.apiKey?.startsWith("pqa_")) {
       throw new PQAuthError(
         'Invalid API key. Keys must start with "pqa_". Get one at https://pqauth-dashboard.pages.dev',
         "INVALID_API_KEY"
       );
     }
   }
-  // ── Private: fetch wrapper ──────────────────────────────────────────────────
+  // ── Private fetch wrapper ───────────────────────────────────────────────────
   async request(path, options = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeout);
@@ -64,20 +84,12 @@ var PQAuth = class {
   // ── sign() ──────────────────────────────────────────────────────────────────
   /**
    * Sign a token for an authenticated user.
-   * Call this after verifying the user's credentials in your own system.
    *
    * @example
-   * const { token } = await pqauth.sign({
-   *   sub: user.id,
-   *   email: user.email,
-   *   role: 'admin',
-   *   expiresInSeconds: 3600
-   * })
+   * const { token } = await pqauth.sign({ sub: user.id, email: user.email })
    */
   async sign(options) {
-    if (!options.sub) {
-      throw new PQAuthError('"sub" is required', "MISSING_SUB");
-    }
+    if (!options.sub) throw new PQAuthError('"sub" is required', "MISSING_SUB");
     return this.request("/sign", {
       method: "POST",
       body: JSON.stringify(options)
@@ -86,13 +98,11 @@ var PQAuth = class {
   // ── verify() ────────────────────────────────────────────────────────────────
   /**
    * Verify a PQAuth token.
-   * Returns { valid: true, payload } if valid, or { valid: false, error } if not.
-   * Never throws — safe to use in middleware.
+   * Never throws — returns { valid: false, error } on failure.
    *
    * @example
    * const { valid, payload } = await pqauth.verify(token)
    * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
-   * console.log(payload.sub) // user id
    */
   async verify(token) {
     try {
@@ -102,39 +112,55 @@ var PQAuth = class {
       });
       return { valid: true, payload: data.payload };
     } catch (err) {
-      if (err instanceof PQAuthError) {
-        return { valid: false, payload: null, error: err.message };
-      }
+      if (err instanceof PQAuthError) return { valid: false, payload: null, error: err.message };
       return { valid: false, payload: null, error: "Unknown error" };
     }
+  }
+  // ── revoke() ────────────────────────────────────────────────────────────────
+  /**
+   * Revoke a token immediately.
+   * Once revoked, the token will be rejected on any future verify() call.
+   *
+   * @example
+   * // Revoke on logout or when a session is compromised
+   * await pqauth.revoke(token, 'user logged out')
+   */
+  async revoke(token, reason) {
+    return this.request("/revoke", {
+      method: "POST",
+      body: JSON.stringify({ token, reason })
+    });
+  }
+  // ── usage() ─────────────────────────────────────────────────────────────────
+  /**
+   * Get current month usage and 6-month history.
+   *
+   * @example
+   * const { current } = await pqauth.usage()
+   * console.log(`${current.count} / ${current.limit} tokens used`)
+   */
+  async usage() {
+    return this.request("/usage");
   }
   // ── middleware() ─────────────────────────────────────────────────────────────
   /**
    * Express / Fastify middleware.
-   * Reads the token from the Authorization header (Bearer token).
+   * Reads the token from the Authorization: Bearer header.
    * Attaches payload to req.user if valid.
    *
    * @example
-   * // Express
    * app.use('/api', pqauth.middleware())
-   *
-   * // Fastify
-   * fastify.addHook('preHandler', pqauth.middleware())
    */
   middleware() {
     return async (req, res, next) => {
       const authHeader = req.headers["authorization"];
       const headerValue = Array.isArray(authHeader) ? authHeader[0] : authHeader;
       if (!headerValue?.startsWith("Bearer ")) {
-        return res.status(401).json({
-          error: "Authorization header required (Bearer <token>)"
-        });
+        return res.status(401).json({ error: "Authorization header required (Bearer <token>)" });
       }
       let token;
       try {
-        token = JSON.parse(
-          Buffer.from(headerValue.slice(7), "base64").toString("utf8")
-        );
+        token = JSON.parse(Buffer.from(headerValue.slice(7), "base64").toString("utf8"));
       } catch {
         return res.status(401).json({ error: "Invalid token format" });
       }
@@ -149,10 +175,6 @@ var PQAuth = class {
   // ── health() ────────────────────────────────────────────────────────────────
   /**
    * Check the PQAuth service status.
-   *
-   * @example
-   * const health = await pqauth.health()
-   * console.log(health.quantumResistant) // true
    */
   async health() {
     const res = await fetch(`${this.baseUrl}/health`);

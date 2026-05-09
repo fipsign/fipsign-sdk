@@ -6,38 +6,26 @@
  *
  * @example
  * import { PQAuth } from 'pqauth-sdk'
- *
  * const pqauth = new PQAuth('pqa_your_api_key')
  *
- * // Sign a token
- * const { token } = await pqauth.sign({ sub: 'user_123', email: 'user@app.com' })
- *
- * // Verify a token
+ * const { token } = await pqauth.sign({ sub: 'user_123' })
  * const { valid, payload } = await pqauth.verify(token)
  */
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface PQAuthOptions {
-  /** Your PQAuth API key (starts with pqa_) */
-  apiKey: string
-  /** API base URL. Defaults to the PQAuth cloud service. */
+  apiKey:   string
   baseUrl?: string
-  /** Request timeout in milliseconds. Default: 10000 */
   timeout?: number
 }
 
 export interface SignOptions {
-  /** Subject — userId or email that identifies the end user */
-  sub: string
-  /** Optional email of the end user */
-  email?: string
-  /** Optional role (e.g. 'admin', 'user', 'merchant') */
-  role?: string
-  /** Token expiry in seconds. Default: 3600 (1 hour) */
+  sub:               string
+  email?:            string
+  role?:             string
   expiresInSeconds?: number
-  /** Any additional custom fields */
-  [key: string]: unknown
+  [key: string]:     unknown
 }
 
 export interface PQToken {
@@ -56,12 +44,18 @@ export interface SignResult {
     expiresIn:        number
     issuedFor:        string
   }
+  usage: {
+    count:     number
+    limit:     number
+    remaining: number
+    month:     string
+  }
 }
 
 export interface VerifyResult {
-  valid:   boolean
-  payload: TokenPayload | null
-  error?:  string
+  valid:    boolean
+  payload:  TokenPayload | null
+  error?:   string
 }
 
 export interface TokenPayload {
@@ -73,6 +67,40 @@ export interface TokenPayload {
   [key: string]: unknown
 }
 
+export interface RevokeResult {
+  success:   boolean
+  message:   string
+  revokedAt: number
+  sub:       string
+}
+
+export interface UsageResult {
+  current: {
+    count:     number
+    month:     string
+    limit:     number
+    remaining: number
+    plan:      string
+  }
+  history: { month: string; count: number }[]
+  developer: { email: string; plan: string }
+}
+
+export type WebhookEvent =
+  | 'token.signed'
+  | 'token.rejected'
+  | 'token.revoked'
+  | 'limit.warning'
+  | 'limit.reached'
+
+export interface WebhookResult {
+  webhook: {
+    url:    string
+    events: WebhookEvent[]
+    secret: string
+  }
+}
+
 export interface HealthResult {
   status:           string
   algorithm:        string
@@ -80,6 +108,17 @@ export interface HealthResult {
   quantumResistant: boolean
   version:          string
 }
+
+export interface MiddlewareRequest {
+  headers: { [key: string]: string | string[] | undefined }
+}
+
+export interface MiddlewareResponse {
+  status: (code: number) => MiddlewareResponse
+  json:   (data: unknown) => void
+}
+
+export type NextFunction = (err?: unknown) => void
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -93,19 +132,6 @@ export class PQAuthError extends Error {
     this.name = 'PQAuthError'
   }
 }
-
-// ─── Middleware types ─────────────────────────────────────────────────────────
-
-export interface MiddlewareRequest {
-  headers: { [key: string]: string | string[] | undefined }
-}
-
-export interface MiddlewareResponse {
-  status:  (code: number) => MiddlewareResponse
-  json:    (data: unknown) => void
-}
-
-export type NextFunction = (err?: unknown) => void
 
 // ─── PQAuth client ────────────────────────────────────────────────────────────
 
@@ -125,7 +151,7 @@ export class PQAuth {
       this.timeout = options.timeout ?? 10000
     }
 
-    if (!this.apiKey || !this.apiKey.startsWith('pqa_')) {
+    if (!this.apiKey?.startsWith('pqa_')) {
       throw new PQAuthError(
         'Invalid API key. Keys must start with "pqa_". Get one at https://pqauth-dashboard.pages.dev',
         'INVALID_API_KEY'
@@ -133,12 +159,9 @@ export class PQAuth {
     }
   }
 
-  // ── Private: fetch wrapper ──────────────────────────────────────────────────
+  // ── Private fetch wrapper ───────────────────────────────────────────────────
 
-  private async request<T>(
-    path: string,
-    options: RequestInit = {}
-  ): Promise<T> {
+  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.timeout)
 
@@ -182,24 +205,15 @@ export class PQAuth {
 
   /**
    * Sign a token for an authenticated user.
-   * Call this after verifying the user's credentials in your own system.
    *
    * @example
-   * const { token } = await pqauth.sign({
-   *   sub: user.id,
-   *   email: user.email,
-   *   role: 'admin',
-   *   expiresInSeconds: 3600
-   * })
+   * const { token } = await pqauth.sign({ sub: user.id, email: user.email })
    */
   async sign(options: SignOptions): Promise<SignResult> {
-    if (!options.sub) {
-      throw new PQAuthError('"sub" is required', 'MISSING_SUB')
-    }
-
+    if (!options.sub) throw new PQAuthError('"sub" is required', 'MISSING_SUB')
     return this.request<SignResult>('/sign', {
       method: 'POST',
-      body: JSON.stringify(options),
+      body:   JSON.stringify(options),
     })
   }
 
@@ -207,42 +221,93 @@ export class PQAuth {
 
   /**
    * Verify a PQAuth token.
-   * Returns { valid: true, payload } if valid, or { valid: false, error } if not.
-   * Never throws — safe to use in middleware.
+   * Never throws — returns { valid: false, error } on failure.
    *
    * @example
    * const { valid, payload } = await pqauth.verify(token)
    * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
-   * console.log(payload.sub) // user id
    */
   async verify(token: PQToken): Promise<VerifyResult> {
     try {
       const data = await this.request<VerifyResult & { payload: TokenPayload }>('/verify', {
         method: 'POST',
-        body: JSON.stringify({ token }),
+        body:   JSON.stringify({ token }),
       })
       return { valid: true, payload: data.payload }
     } catch (err) {
-      if (err instanceof PQAuthError) {
-        return { valid: false, payload: null, error: err.message }
-      }
+      if (err instanceof PQAuthError) return { valid: false, payload: null, error: err.message }
       return { valid: false, payload: null, error: 'Unknown error' }
     }
+  }
+
+  // ── revoke() ────────────────────────────────────────────────────────────────
+
+  /**
+   * Revoke a token immediately.
+   * Once revoked, the token will be rejected on any future verify() call.
+   *
+   * @example
+   * // Revoke on logout or when a session is compromised
+   * await pqauth.revoke(token, 'user logged out')
+   */
+  async revoke(token: PQToken, reason?: string): Promise<RevokeResult> {
+    return this.request<RevokeResult>('/revoke', {
+      method: 'POST',
+      body:   JSON.stringify({ token, reason }),
+    })
+  }
+
+  // ── usage() ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Get current month usage and 6-month history.
+   *
+   * @example
+   * const { current } = await pqauth.usage()
+   * console.log(`${current.count} / ${current.limit} tokens used`)
+   */
+  async usage(): Promise<UsageResult> {
+    return this.request<UsageResult>('/usage')
+  }
+
+  // ── webhooks ────────────────────────────────────────────────────────────────
+
+  /**
+   * Register a webhook URL to receive event notifications.
+   *
+   * @example
+   * const { webhook } = await pqauth.webhooks.register({
+   *   url: 'https://myapp.com/webhooks/pqauth',
+   *   events: ['limit.warning', 'limit.reached', 'token.revoked']
+   * })
+   * console.log(webhook.secret) // store this to verify incoming webhooks
+   */
+  readonly webhooks = {
+    register: (options: { url: string; events?: WebhookEvent[] }): Promise<WebhookResult> =>
+      this.request<WebhookResult>('/webhooks', {
+        method: 'POST',
+        body:   JSON.stringify(options),
+      }),
+
+    get: (): Promise<{ webhook: WebhookResult['webhook'] | null }> =>
+      this.request('/webhooks'),
+
+    delete: (): Promise<{ success: boolean }> =>
+      this.request('/webhooks', { method: 'DELETE' }),
+
+    test: (): Promise<{ success: boolean; message: string }> =>
+      this.request('/webhooks/test', { method: 'POST' }),
   }
 
   // ── middleware() ─────────────────────────────────────────────────────────────
 
   /**
    * Express / Fastify middleware.
-   * Reads the token from the Authorization header (Bearer token).
+   * Reads the token from the Authorization: Bearer header.
    * Attaches payload to req.user if valid.
    *
    * @example
-   * // Express
    * app.use('/api', pqauth.middleware())
-   *
-   * // Fastify
-   * fastify.addHook('preHandler', pqauth.middleware())
    */
   middleware() {
     return async (
@@ -250,20 +315,16 @@ export class PQAuth {
       res: MiddlewareResponse,
       next: NextFunction
     ) => {
-      const authHeader = req.headers['authorization']
+      const authHeader  = req.headers['authorization']
       const headerValue = Array.isArray(authHeader) ? authHeader[0] : authHeader
 
       if (!headerValue?.startsWith('Bearer ')) {
-        return res.status(401).json({
-          error: 'Authorization header required (Bearer <token>)'
-        })
+        return res.status(401).json({ error: 'Authorization header required (Bearer <token>)' })
       }
 
       let token: PQToken
       try {
-        token = JSON.parse(
-          Buffer.from(headerValue.slice(7), 'base64').toString('utf8')
-        )
+        token = JSON.parse(Buffer.from(headerValue.slice(7), 'base64').toString('utf8'))
       } catch {
         return res.status(401).json({ error: 'Invalid token format' })
       }
@@ -283,17 +344,11 @@ export class PQAuth {
 
   /**
    * Check the PQAuth service status.
-   *
-   * @example
-   * const health = await pqauth.health()
-   * console.log(health.quantumResistant) // true
    */
   async health(): Promise<HealthResult> {
     const res = await fetch(`${this.baseUrl}/health`)
     return res.json()
   }
 }
-
-// ─── Default export ───────────────────────────────────────────────────────────
 
 export default PQAuth
