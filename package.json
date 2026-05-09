@@ -1,0 +1,44 @@
+{
+  "name": "pqauth-sdk",
+  "version": "0.1.0",
+  "description": "Post-quantum authentication SDK — ML-DSA-65 (NIST FIPS 204)",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "authentication",
+    "post-quantum",
+    "ml-dsa",
+    "quantum-resistant",
+    "security",
+    "jwt",
+    "token",
+    "nist",
+    "fips-204",
+    "auth"
+  ],
+  "author": "PQAuth",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "tsup": "^8.2.4",
+    "typescript": "^5.5.3"
+  }
+}
