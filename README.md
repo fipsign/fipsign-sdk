@@ -194,3 +194,38 @@ JWT with RS256/ES256 and OAuth tokens sign with ECDSA or RSA — vulnerable to S
 - Dashboard: [pqauth-dashboard.pages.dev](https://pqauth-dashboard.pages.dev)
 - API status: [pqauth-core.gdbok.workers.dev/health](https://pqauth-core.gdbok.workers.dev/health)
 - NIST FIPS 204: [csrc.nist.gov](https://csrc.nist.gov/pubs/fips/204/final)
+
+---
+
+## Local verification (offline, ~1ms)
+
+By default `verify()` calls the API. Enable `localVerify` to verify tokens entirely in memory using the cached public key — no network call needed.
+
+```typescript
+// Enable local verification at construction
+const pqauth = new PQAuth({
+  apiKey:      'pqa_your_api_key',
+  localVerify: true               // verify locally, no API call
+})
+
+// Optional: preload the public key at startup
+// to avoid first-request latency
+await pqauth.preloadPublicKey()
+
+// verify() now runs in ~1ms with no network call
+const { valid, payload, local } = await pqauth.verify(token)
+console.log(local) // true — verified locally
+```
+
+**How it works:**
+- On first `verify()`, the public key is fetched from the API and cached for 1 hour
+- All subsequent verifications use the cached key — pure ML-DSA-65 in memory
+- If keys are rotated (via `/admin/rotate-keys`), the SDK detects the mismatch and automatically refreshes the cache
+- Revocation still requires an API call — `revoke()` is always online
+
+**When to use local verification:**
+- High-traffic endpoints where every millisecond counts
+- Serverless functions where you want to minimize external calls
+- Edge environments (Cloudflare Workers, Vercel Edge) where latency is critical
+
+**Note:** local verification does not check the revocation blacklist. If you need revocation checking, use remote verification (default) or call `verify()` remotely on sensitive operations.

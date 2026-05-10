@@ -25,6 +25,7 @@ __export(index_exports, {
   default: () => index_default
 });
 module.exports = __toCommonJS(index_exports);
+var import_ml_dsa = require("@noble/post-quantum/ml-dsa.js");
 var PQAuthError = class extends Error {
   constructor(message, code, status) {
     super(message);
@@ -33,19 +34,37 @@ var PQAuthError = class extends Error {
     this.name = "PQAuthError";
   }
 };
+function fromBase64(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function verifyLocally(token, publicKeyB64) {
+  if (token.algorithm !== "ML-DSA-65") {
+    throw new PQAuthError(`Unsupported algorithm: ${token.algorithm}`, "UNSUPPORTED_ALGORITHM");
+  }
+  const publicKey = fromBase64(publicKeyB64);
+  const signature = fromBase64(token.signature);
+  const message = new TextEncoder().encode(token.payload);
+  const isValid = import_ml_dsa.ml_dsa65.verify(signature, message, publicKey);
+  if (!isValid) {
+    throw new PQAuthError("Invalid signature \u2014 token was tampered with or not issued by this server", "INVALID_SIGNATURE");
+  }
+  const payload = JSON.parse(atob(token.payload));
+  const now = Math.floor(Date.now() / 1e3);
+  if (payload.exp < now) {
+    const ago = now - payload.exp;
+    throw new PQAuthError(`Token expired ${ago} seconds ago`, "TOKEN_EXPIRED");
+  }
+  return payload;
+}
 var PQAuth = class {
+  // refresh public key every hour
   constructor(options) {
+    this.cachedKey = null;
+    this.keyTTL = 3600;
     // ── webhooks ────────────────────────────────────────────────────────────────
-    /**
-     * Register a webhook URL to receive event notifications.
-     *
-     * @example
-     * const { webhook } = await pqauth.webhooks.register({
-     *   url: 'https://myapp.com/webhooks/pqauth',
-     *   events: ['limit.warning', 'limit.reached', 'token.revoked']
-     * })
-     * console.log(webhook.secret) // store this to verify incoming webhooks
-     */
     this.webhooks = {
       register: (options) => this.request("/webhooks", {
         method: "POST",
@@ -59,10 +78,12 @@ var PQAuth = class {
       this.apiKey = options;
       this.baseUrl = "https://pqauth-core.gdbok.workers.dev";
       this.timeout = 1e4;
+      this.localVerify = false;
     } else {
       this.apiKey = options.apiKey;
       this.baseUrl = options.baseUrl ?? "https://pqauth-core.gdbok.workers.dev";
       this.timeout = options.timeout ?? 1e4;
+      this.localVerify = options.localVerify ?? false;
     }
     if (!this.apiKey?.startsWith("pqa_")) {
       throw new PQAuthError(
@@ -71,7 +92,7 @@ var PQAuth = class {
       );
     }
   }
-  // ── Private fetch wrapper ───────────────────────────────────────────────────
+  // ── Private: fetch wrapper ──────────────────────────────────────────────────
   async request(path, options = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeout);
@@ -107,6 +128,21 @@ var PQAuth = class {
       clearTimeout(timer);
     }
   }
+  // ── Private: get public key (with cache) ────────────────────────────────────
+  async getPublicKey() {
+    const now = Math.floor(Date.now() / 1e3);
+    if (this.cachedKey && now - this.cachedKey.fetchedAt < this.cachedKey.ttlSeconds) {
+      return this.cachedKey.publicKey;
+    }
+    const res = await fetch(`${this.baseUrl}/public-key`);
+    const data = await res.json();
+    this.cachedKey = {
+      publicKey: data.publicKey,
+      fetchedAt: now,
+      ttlSeconds: this.keyTTL
+    };
+    return data.publicKey;
+  }
   // ── sign() ──────────────────────────────────────────────────────────────────
   /**
    * Sign a token for an authenticated user.
@@ -124,31 +160,68 @@ var PQAuth = class {
   // ── verify() ────────────────────────────────────────────────────────────────
   /**
    * Verify a PQAuth token.
+   *
+   * If localVerify: true was set in the constructor, verification happens
+   * entirely in memory using the cached public key — no API call, ~1ms latency.
+   *
+   * If localVerify: false (default), verification is done by the API.
+   *
    * Never throws — returns { valid: false, error } on failure.
    *
    * @example
+   * // Online verification (default)
+   * const pqauth = new PQAuth('pqa_...')
    * const { valid, payload } = await pqauth.verify(token)
-   * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
+   *
+   * // Local verification (no API call, ~1ms)
+   * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true })
+   * const { valid, payload, local } = await pqauth.verify(token)
    */
   async verify(token) {
+    if (this.localVerify) {
+      return this.verifyLocal(token);
+    }
+    return this.verifyRemote(token);
+  }
+  async verifyRemote(token) {
     try {
       const data = await this.request("/verify", {
         method: "POST",
         body: JSON.stringify({ token })
       });
-      return { valid: true, payload: data.payload };
+      return { valid: true, payload: data.payload, local: false };
     } catch (err) {
-      if (err instanceof PQAuthError) return { valid: false, payload: null, error: err.message };
-      return { valid: false, payload: null, error: "Unknown error" };
+      if (err instanceof PQAuthError) return { valid: false, payload: null, error: err.message, local: false };
+      return { valid: false, payload: null, error: "Unknown error", local: false };
+    }
+  }
+  async verifyLocal(token) {
+    try {
+      const publicKey = await this.getPublicKey();
+      const payload = verifyLocally(token, publicKey);
+      return { valid: true, payload, local: true };
+    } catch (err) {
+      if (err instanceof PQAuthError && err.code === "INVALID_SIGNATURE") {
+        this.cachedKey = null;
+        try {
+          const publicKey = await this.getPublicKey();
+          const payload = verifyLocally(token, publicKey);
+          return { valid: true, payload, local: true };
+        } catch {
+        }
+      }
+      const message = err instanceof PQAuthError ? err.message : "Unknown error";
+      return { valid: false, payload: null, error: message, local: true };
     }
   }
   // ── revoke() ────────────────────────────────────────────────────────────────
   /**
    * Revoke a token immediately.
-   * Once revoked, the token will be rejected on any future verify() call.
+   * Future verify() calls will reject it even if the signature is valid.
+   *
+   * Note: revocation requires an API call even when localVerify is enabled.
    *
    * @example
-   * // Revoke on logout or when a session is compromised
    * await pqauth.revoke(token, 'user logged out')
    */
   async revoke(token, reason) {
@@ -160,10 +233,6 @@ var PQAuth = class {
   // ── usage() ─────────────────────────────────────────────────────────────────
   /**
    * Get current month usage and 6-month history.
-   *
-   * @example
-   * const { current } = await pqauth.usage()
-   * console.log(`${current.count} / ${current.limit} tokens used`)
    */
   async usage() {
     return this.request("/usage");
@@ -171,8 +240,7 @@ var PQAuth = class {
   // ── middleware() ─────────────────────────────────────────────────────────────
   /**
    * Express / Fastify middleware.
-   * Reads the token from the Authorization: Bearer header.
-   * Attaches payload to req.user if valid.
+   * Reads Authorization: Bearer header and attaches payload to req.user.
    *
    * @example
    * app.use('/api', pqauth.middleware())
@@ -198,10 +266,20 @@ var PQAuth = class {
       next();
     };
   }
-  // ── health() ────────────────────────────────────────────────────────────────
+  // ── preloadPublicKey() ────────────────────────────────────────────────────────
   /**
-   * Check the PQAuth service status.
+   * Preload and cache the public key.
+   * Call this at app startup when using localVerify: true
+   * to avoid the first-request latency.
+   *
+   * @example
+   * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true })
+   * await pqauth.preloadPublicKey() // at startup
    */
+  async preloadPublicKey() {
+    await this.getPublicKey();
+  }
+  // ── health() ────────────────────────────────────────────────────────────────
   async health() {
     const res = await fetch(`${this.baseUrl}/health`);
     return res.json();
