@@ -1,8 +1,10 @@
 # pqauth-sdk
 
-Post-quantum authentication SDK for Node.js and the browser.
+Post-quantum signing SDK for Node.js and the browser.
 
-Signs and verifies tokens using **ML-DSA-65** (NIST FIPS 204) — the post-quantum digital signature standard resistant to attacks from quantum computers, including Shor's algorithm. Standardized by NIST in August 2024.
+Signs and verifies any payload using **ML-DSA-65** (NIST FIPS 204) — the post-quantum digital signature standard resistant to Shor's algorithm. Standardized by NIST in August 2024.
+
+**Not just for auth.** Sign users, orders, documents, devices, events — any entity that needs a tamper-proof, quantum-resistant signature.
 
 ---
 
@@ -17,8 +19,10 @@ npm install pqauth-sdk
 ## Quick start
 
 **1.** Create a free account at [pqauth-dashboard.pages.dev](https://pqauth-dashboard.pages.dev)
+— enter your email, verify the OTP code sent to your inbox.
 
-**2.** On registration, a default project and its API key are created automatically. Save the key — it won't be shown again.
+**2.** In the dashboard, create a project, then create an API key inside that project.
+Save the key — it will not be shown again.
 
 **3.** Use the key in your app:
 
@@ -27,26 +31,45 @@ import { PQAuth } from 'pqauth-sdk'
 
 const pqauth = new PQAuth('pqa_your_api_key')
 ```
-
 ---
 
-## sign() — Sign a token
+## sign() — Sign anything
 
-Call this after verifying your user's credentials. Each call counts against your monthly token quota.
+The only required field is `sub` — any string identifying the entity you want to sign. All other fields are stored in the payload and returned on verify.
 
 ```typescript
+// Sign a user session
 const { token, usage } = await pqauth.sign({
-  sub:              'user_123',          // required — user ID
-  email:            'user@example.com',  // optional
-  role:             'admin',             // optional
-  expiresInSeconds: 3600,               // optional, default 1 hour
+  sub:              'user_123',
+  email:            'user@example.com',
+  role:             'admin',
+  expiresInSeconds: 3600,           // optional, default 1 hour
 })
 
-// Send token to your frontend
-res.json({ token })
+// Sign an order
+const { token } = await pqauth.sign({
+  sub:    'order_456',
+  amount: 299.99,
+  currency: 'USD',
+})
 
-// Monitor your quota
-console.log(`${usage.remaining} tokens remaining this month`)
+// Sign a document
+const { token } = await pqauth.sign({
+  sub:      'doc_789',
+  hash:     'sha256:abc...',
+  signedBy: 'alice',
+})
+
+// Sign a device
+const { token } = await pqauth.sign({
+  sub:      'device_iot_001',
+  firmware: '2.1.4',
+})
+
+// Monitor quota
+console.log(`${usage.freeRemaining} free tokens remaining this month`)
+console.log(`${usage.packRemaining} pack tokens remaining`)
+console.log(`${usage.totalRemaining} total remaining`)
 ```
 
 ---
@@ -62,10 +85,9 @@ if (!valid) {
   return res.status(401).json({ error: 'Unauthorized' })
 }
 
-console.log(payload.sub)   // 'user_123'
-console.log(payload.email) // 'user@example.com'
-console.log(payload.role)  // 'admin'
+console.log(payload.sub)   // 'user_123' (or 'order_456', 'doc_789', etc.)
 console.log(payload.exp)   // expiry timestamp (Unix)
+// All custom fields are available on payload too
 ```
 
 ---
@@ -87,7 +109,7 @@ const { valid, payload, local } = await pqauth.verify(token)
 console.log(local) // true — verified without an API call
 ```
 
-**Important:** local verification does not check the revocation list. Use remote verification for sensitive operations (admin actions, payments, etc.).
+**Important:** local verification does not check the revocation list. Use remote verification for sensitive operations (payments, admin actions, etc.).
 
 When server keys are rotated, the SDK automatically detects the mismatch, refreshes the cached key, and retries — no action needed on your end.
 
@@ -98,10 +120,7 @@ When server keys are rotated, the SDK automatically detects the mismatch, refres
 Immediately invalidates a token. Future `verify()` calls will reject it even if the signature is valid and it hasn't expired.
 
 ```typescript
-// On logout
 await pqauth.revoke(token, 'user logged out')
-
-// On security event
 await pqauth.revoke(token, 'suspicious activity detected')
 ```
 
@@ -120,23 +139,18 @@ const pqauth = new PQAuth('pqa_your_api_key')
 
 app.use(express.json())
 
-// Login: verify credentials, then issue a PQAuth token
 app.post('/login', async (req, res) => {
   const user = await db.users.findByEmail(req.body.email)
   if (!user || !checkPassword(req.body.password, user.passwordHash)) {
     return res.status(401).json({ error: 'Invalid credentials' })
   }
 
-  const { token } = await pqauth.sign({
-    sub:   user.id,
-    email: user.email,
-    role:  user.role,
-  })
-
-  res.json({ token })
+  const { token } = await pqauth.sign({ sub: user.id, email: user.email, role: user.role })
+  // Encode the token as base64 for the Authorization header
+  const encoded = Buffer.from(JSON.stringify(token)).toString('base64')
+  res.json({ token, encoded })
 })
 
-// Logout: revoke the token immediately
 app.post('/logout', async (req, res) => {
   const token = getTokenFromRequest(req)
   if (token) await pqauth.revoke(token, 'user logged out')
@@ -153,20 +167,25 @@ app.get('/api/profile', (req, res) => {
 
 ---
 
-## usage() — Monthly quota
+## usage() — Token balance
 
-Usage is tracked globally per account. All projects share a single monthly pool defined by your plan. On the free plan, this is **10,000 tokens per month**.
+Free tokens reset on the 1st of each month (UTC). Pack tokens never expire and accumulate across purchases.
 
 ```typescript
-const { current, history } = await pqauth.usage()
+const { current, monthlyHistory, packs } = await pqauth.usage()
 
-console.log(`${current.count} / ${current.limit} tokens used`)
-console.log(`${current.remaining} remaining — resets ${current.month}`)
-console.log(`Plan: ${current.plan}`)
+console.log(`Free: ${current.freeRemaining} / ${current.freeLimit}`)
+console.log(`Pack: ${current.packRemaining}`)
+console.log(`Total: ${current.totalRemaining}`)
 
 // 6-month history
-history.forEach(({ month, count }) => {
-  console.log(`${month}: ${count} tokens`)
+monthlyHistory.forEach(({ month, tokensUsed, fromFree, fromPack }) => {
+  console.log(`${month}: ${tokensUsed} used (${fromFree} free + ${fromPack} pack)`)
+})
+
+// Purchased packs
+packs.forEach(({ packType, tokensPurchased, purchasedAt }) => {
+  console.log(`${packType}: ${tokensPurchased} tokens — ${new Date(purchasedAt * 1000).toLocaleDateString()}`)
 })
 ```
 
@@ -174,27 +193,20 @@ history.forEach(({ month, count }) => {
 
 ## webhooks — Real-time notifications
 
-Get notified when important events happen in your account.
-
 **Events:** `token.signed` · `token.rejected` · `token.revoked` · `limit.warning` · `limit.reached`
 
 ```typescript
-// Register a webhook endpoint
+// Register
 const { webhook } = await pqauth.webhooks.register({
   url:    'https://yourapp.com/webhooks/pqauth',
   events: ['limit.warning', 'limit.reached', 'token.revoked'],
 })
 
-// Store webhook.secret securely — you'll need it to verify incoming requests
+// Store webhook.secret securely — it won't be shown again
 console.log(webhook.secret)
 
-// Send a test event
-await pqauth.webhooks.test()
-
-// Get current config
+await pqauth.webhooks.test()                    // send a test event
 const { webhook: config } = await pqauth.webhooks.get()
-
-// Remove webhook
 await pqauth.webhooks.delete()
 ```
 
@@ -214,14 +226,14 @@ app.post('/webhooks/pqauth', express.json(), (req, res) => {
     return res.status(401).send('Invalid signature')
   }
 
-  const { event, data, timestamp } = req.body
+  const { event, data } = req.body
 
   switch (event) {
     case 'limit.warning':
-      console.warn(`Usage warning: ${data.count}/${data.limit} tokens used`)
+      console.warn(`Usage warning — ${data.freeRemaining} free tokens left this month`)
       break
     case 'limit.reached':
-      console.error('Monthly token limit reached')
+      console.error(`Limit reached — pack remaining: ${data.packRemaining}`)
       break
     case 'token.revoked':
       console.log(`Token revoked for sub: ${data.sub}`)
@@ -229,40 +241,6 @@ app.post('/webhooks/pqauth', express.json(), (req, res) => {
   }
 
   res.status(200).send('ok')
-})
-```
-
----
-
-## Projects
-
-Your account can have up to **5 projects** on the free plan. Each project gets its own API key, but all projects share the same monthly token pool.
-
-Projects are managed through the dashboard or the API directly:
-
-```typescript
-// Projects are created and managed via the dashboard.
-// Each project gets its own API key on creation.
-// Deleting a project revokes its keys but does not affect your usage count.
-```
-
----
-
-## Works with any identity provider
-
-PQAuth handles the token layer. You verify the user's identity however you want — then issue a post-quantum token.
-
-```typescript
-// After Google OAuth, Particle Network, Auth0, or your own login
-app.post('/auth/callback', async (req, res) => {
-  const { verifiedUser } = req.body  // from your auth provider
-
-  const { token } = await pqauth.sign({
-    sub:   verifiedUser.id,
-    email: verifiedUser.email,
-  })
-
-  res.json({ token })
 })
 ```
 
@@ -278,13 +256,13 @@ try {
 } catch (err) {
   if (err instanceof PQAuthError) {
     switch (err.code) {
-      case 'INVALID_API_KEY':  // bad or missing API key
-      case 'API_ERROR':        // server returned an error (check err.status)
-      case 'TIMEOUT':          // request exceeded timeout (default: 10s)
-      case 'NETWORK_ERROR':    // connection failed
-      case 'MISSING_SUB':      // sign() called without sub
-      case 'INVALID_SIGNATURE': // local verify: token tampered
-      case 'TOKEN_EXPIRED':    // local verify: token expired
+      case 'INVALID_API_KEY':       // bad or missing API key
+      case 'API_ERROR':             // server returned an error (check err.status)
+      case 'TIMEOUT':               // request exceeded timeout (default: 10s)
+      case 'NETWORK_ERROR':         // connection failed
+      case 'MISSING_SUB':           // sign() called without sub
+      case 'INVALID_SIGNATURE':     // local verify: token tampered
+      case 'TOKEN_EXPIRED':         // local verify: token expired
       case 'UNSUPPORTED_ALGORITHM': // local verify: unknown algorithm
     }
     console.error(err.code, err.message, err.status)
@@ -294,18 +272,11 @@ try {
 
 ---
 
-## Plans
+## Token quota
 
-| Feature | Free |
-|---|---|
-| Tokens / month | 10,000 |
-| Projects | 5 |
-| API keys | 5 (1 per project) |
-| Webhooks | ✓ |
-| Local verification | ✓ |
-| Token revocation | ✓ |
+Every account gets **10,000 free tokens per month**, reset on the 1st (UTC). Additional tokens are available as non-expiring packs, managed through the dashboard.
 
-Usage resets on the first of each month (UTC). Signing tokens (`/sign`) counts against your quota. Verification and revocation do not.
+Each operation costs 1 token: signing (`/sign`), verification (`/verify`), and revocation (`/revoke`).
 
 ---
 

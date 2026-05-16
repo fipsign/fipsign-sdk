@@ -1,8 +1,11 @@
 /**
- * pqauth-sdk v0.3.0
+ * pqauth-sdk v0.4.0
  *
- * Post-quantum authentication SDK for Node.js and the browser.
+ * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
+ *
+ * Sign anything: users, orders, documents, devices, events.
+ * The only required field is `sub` — any string identifying the entity.
  */
 interface PQAuthOptions {
     apiKey: string;
@@ -12,8 +15,6 @@ interface PQAuthOptions {
 }
 interface SignOptions {
     sub: string;
-    email?: string;
-    role?: string;
     expiresInSeconds?: number;
     [key: string]: unknown;
 }
@@ -31,11 +32,14 @@ interface SignResult {
         quantumResistant: boolean;
         expiresIn: number;
         issuedFor: string;
+        projectId: string;
+        tokenCost: number;
+        source: 'free' | 'pack' | 'free+pack';
     };
     usage: {
-        count: number;
-        limit: number;
-        remaining: number;
+        freeRemaining: number;
+        packRemaining: number;
+        totalRemaining: number;
         month: string;
     };
 }
@@ -47,8 +51,6 @@ interface VerifyResult {
 }
 interface TokenPayload {
     sub: string;
-    email?: string;
-    role?: string;
     iat: number;
     exp: number;
     [key: string]: unknown;
@@ -58,23 +60,35 @@ interface RevokeResult {
     message: string;
     revokedAt: number;
     sub: string;
+    expiresAt: number;
+    note: string;
 }
 interface UsageResult {
     current: {
-        count: number;
         month: string;
-        limit: number;
-        remaining: number;
-        plan: string;
+        freeUsed: number;
+        freeRemaining: number;
+        freeLimit: number;
+        packRemaining: number;
+        totalRemaining: number;
     };
-    history: {
+    monthlyHistory: {
         month: string;
-        count: number;
+        tokensUsed: number;
+        fromFree: number;
+        fromPack: number;
+    }[];
+    packs: {
+        id: string;
+        packType: string;
+        tokensPurchased: number;
+        purchasedAt: number;
+        paymentRef: string | null;
     }[];
     developer: {
         email: string;
-        plan: string;
     };
+    note: string;
 }
 type WebhookEvent = 'token.signed' | 'token.rejected' | 'token.revoked' | 'limit.warning' | 'limit.reached';
 interface WebhookResult {
@@ -117,48 +131,72 @@ declare class PQAuth {
     private request;
     private getPublicKey;
     /**
-     * Sign a token for an authenticated user.
+     * Sign any payload with ML-DSA-65.
+     *
+     * The only required field is `sub` — any string identifying the entity:
+     * a user, an order, a document, a device, an event, anything.
+     * All other fields are stored in the payload and returned on verify.
+     *
+     * Each call counts against your monthly token quota.
      *
      * @example
-     * const { token } = await pqauth.sign({ sub: user.id, email: user.email })
+     * const { token } = await pqauth.sign({ sub: 'user_123', role: 'admin' })
+     * const { token } = await pqauth.sign({ sub: 'order_456', amount: 299.99 })
+     * const { token } = await pqauth.sign({ sub: 'doc_789', hash: 'sha256:abc...' })
      */
     sign(options: SignOptions): Promise<SignResult>;
     /**
      * Verify a PQAuth token.
      *
-     * If localVerify: true was set in the constructor, verification happens
-     * entirely in memory using the cached public key — no API call, ~1ms latency.
-     *
-     * If localVerify: false (default), verification is done by the API.
-     *
      * Never throws — returns { valid: false, error } on failure.
      *
-     * @example
-     * // Online verification (default)
-     * const pqauth = new PQAuth('pqa_...')
-     * const { valid, payload } = await pqauth.verify(token)
+     * If localVerify: true, verification happens entirely in memory (~1ms, no API call).
+     * Local verification does not check the revocation list — use remote verification
+     * for sensitive operations such as payments or admin actions.
      *
-     * // Local verification (no API call, ~1ms)
-     * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true })
-     * const { valid, payload, local } = await pqauth.verify(token)
+     * When server keys are rotated, the SDK automatically detects the mismatch,
+     * refreshes the cached public key, and retries — no action needed on your end.
+     *
+     * @example
+     * const { valid, payload } = await pqauth.verify(token)
+     * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
      */
     verify(token: PQToken): Promise<VerifyResult>;
     private verifyRemote;
     private verifyLocal;
     /**
      * Revoke a token immediately.
-     * Future verify() calls will reject it even if the signature is valid.
      *
-     * Note: revocation requires an API call even when localVerify is enabled.
+     * Future verify() calls will reject it even if the signature is valid
+     * and the token has not yet expired.
+     *
+     * Revocation always requires an API call, even when localVerify is enabled.
      *
      * @example
      * await pqauth.revoke(token, 'user logged out')
+     * await pqauth.revoke(token, 'suspicious activity detected')
      */
     revoke(token: PQToken, reason?: string): Promise<RevokeResult>;
     /**
-     * Get current month usage and 6-month history.
+     * Get current token balance and 6-month usage history.
+     *
+     * Free tokens reset on the 1st of each month (UTC) and do not accumulate.
+     * Pack tokens never expire and accumulate across purchases.
+     * All projects under the same account share a single pool.
      */
     usage(): Promise<UsageResult>;
+    /**
+     * Manage webhook configuration for real-time event notifications.
+     *
+     * Events: token.signed · token.rejected · token.revoked · limit.warning · limit.reached
+     *
+     * @example
+     * const { webhook } = await pqauth.webhooks.register({
+     *   url:    'https://yourapp.com/webhooks/pqauth',
+     *   events: ['limit.warning', 'limit.reached', 'token.revoked'],
+     * })
+     * console.log(webhook.secret) // store this — it won't be shown again
+     */
     readonly webhooks: {
         register: (options: {
             url: string;
@@ -176,25 +214,34 @@ declare class PQAuth {
         }>;
     };
     /**
-     * Express / Fastify middleware.
-     * Reads Authorization: Bearer header and attaches payload to req.user.
+     * Express / Fastify middleware. Node.js only.
+     *
+     * Reads Authorization: Bearer <base64(token)> and attaches the decoded
+     * payload to req.user. Returns 401 if the token is missing or invalid.
      *
      * @example
      * app.use('/api', pqauth.middleware())
+     *
+     * app.get('/api/profile', (req, res) => {
+     *   res.json({ user: req.user })
+     * })
      */
     middleware(): (req: MiddlewareRequest & {
         user?: TokenPayload;
     }, res: MiddlewareResponse, next: NextFunction) => Promise<void>;
     /**
-     * Preload and cache the public key.
-     * Call this at app startup when using localVerify: true
-     * to avoid the first-request latency.
+     * Preload and cache the server's public key at startup.
+     *
+     * Recommended when using localVerify: true to avoid first-request latency.
      *
      * @example
      * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true })
-     * await pqauth.preloadPublicKey() // at startup
+     * await pqauth.preloadPublicKey() // call once at startup
      */
     preloadPublicKey(): Promise<void>;
+    /**
+     * Check the health of the PQAuth service.
+     */
     health(): Promise<HealthResult>;
 }
 

@@ -1,8 +1,11 @@
 /**
  * pqauth-sdk v0.4.0
  *
- * Post-quantum authentication SDK for Node.js and the browser.
+ * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
+ *
+ * Sign anything: users, orders, documents, devices, events.
+ * The only required field is `sub` — any string identifying the entity.
  */
 
 import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js'
@@ -18,8 +21,6 @@ export interface PQAuthOptions {
 
 export interface SignOptions {
   sub:               string
-  email?:            string
-  role?:             string
   expiresInSeconds?: number
   [key: string]:     unknown
 }
@@ -40,12 +41,14 @@ export interface SignResult {
     expiresIn:        number
     issuedFor:        string
     projectId:        string
+    tokenCost:        number
+    source:           'free' | 'pack' | 'free+pack'
   }
   usage: {
-    count:     number
-    limit:     number
-    remaining: number
-    month:     string
+    freeRemaining:  number
+    packRemaining:  number
+    totalRemaining: number
+    month:          string
   }
 }
 
@@ -57,11 +60,9 @@ export interface VerifyResult {
 }
 
 export interface TokenPayload {
-  sub:    string
-  email?: string
-  role?:  string
-  iat:    number
-  exp:    number
+  sub: string
+  iat: number
+  exp: number
   [key: string]: unknown
 }
 
@@ -70,21 +71,34 @@ export interface RevokeResult {
   message:   string
   revokedAt: number
   sub:       string
+  expiresAt: number
+  note:      string
 }
 
-// Usage is tracked globally per developer account (not per project).
-// All projects share a single monthly pool defined by the account plan.
 export interface UsageResult {
   current: {
-    count:     number
-    month:     string
-    limit:     number
-    remaining: number
-    plan:      string
+    month:          string
+    freeUsed:       number
+    freeRemaining:  number
+    freeLimit:      number
+    packRemaining:  number
+    totalRemaining: number
   }
-  history:   { month: string; count: number }[]
-  developer: { email: string; plan: string }
-  note:      string
+  monthlyHistory: {
+    month:      string
+    tokensUsed: number
+    fromFree:   number
+    fromPack:   number
+  }[]
+  packs: {
+    id:              string
+    packType:        string
+    tokensPurchased: number
+    purchasedAt:     number
+    paymentRef:      string | null
+  }[]
+  developer: { email: string }
+  note:       string
 }
 
 export type WebhookEvent =
@@ -161,7 +175,6 @@ function verifyLocally(token: PQToken, publicKeyB64: string): TokenPayload {
   }
 
   const payload: TokenPayload = JSON.parse(atob(token.payload))
-
   const now = Math.floor(Date.now() / 1000)
   if (payload.exp < now) {
     throw new PQAuthError(`Token expired ${now - payload.exp} seconds ago`, 'TOKEN_EXPIRED')
@@ -184,7 +197,7 @@ export class PQAuth {
   private readonly timeout:     number
   private readonly localVerify: boolean
   private cachedKey:            CachedKey | null = null
-  private readonly keyTTL =     3600
+  private readonly keyTTL =     3600 // refresh public key every hour
 
   constructor(options: PQAuthOptions | string) {
     if (typeof options === 'string') {
@@ -207,7 +220,7 @@ export class PQAuth {
     }
   }
 
-  // ── Private: fetch with timeout ─────────────────────────────────────────────
+  // ── Private: fetch wrapper with timeout and error normalization ─────────────
 
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const controller = new AbortController()
@@ -249,7 +262,7 @@ export class PQAuth {
     }
   }
 
-  // ── Private: public key fetch with timeout and cache ────────────────────────
+  // ── Private: public key with cache ──────────────────────────────────────────
 
   private async getPublicKey(): Promise<string> {
     const now = Math.floor(Date.now() / 1000)
@@ -283,11 +296,18 @@ export class PQAuth {
   // ── sign() ──────────────────────────────────────────────────────────────────
 
   /**
-   * Sign a token for an authenticated user.
-   * Call this after verifying your user's credentials.
+   * Sign any payload with ML-DSA-65.
+   *
+   * The only required field is `sub` — any string identifying the entity:
+   * a user, an order, a document, a device, an event, anything.
+   * All other fields are stored in the payload and returned on verify.
+   *
+   * Each call counts against your monthly token quota.
    *
    * @example
-   * const { token } = await pqauth.sign({ sub: user.id, email: user.email })
+   * const { token } = await pqauth.sign({ sub: 'user_123', role: 'admin' })
+   * const { token } = await pqauth.sign({ sub: 'order_456', amount: 299.99 })
+   * const { token } = await pqauth.sign({ sub: 'doc_789', hash: 'sha256:abc...' })
    */
   async sign(options: SignOptions): Promise<SignResult> {
     if (!options.sub) throw new PQAuthError('"sub" is required', 'MISSING_SUB')
@@ -297,10 +317,16 @@ export class PQAuth {
   // ── verify() ────────────────────────────────────────────────────────────────
 
   /**
-   * Verify a PQAuth token. Never throws — returns { valid: false, error } on failure.
+   * Verify a PQAuth token.
    *
-   * If localVerify: true, verification happens in memory (~1ms, no API call).
-   * Note: local verification does not check the revocation list.
+   * Never throws — returns { valid: false, error } on failure.
+   *
+   * If localVerify: true, verification happens entirely in memory (~1ms, no API call).
+   * Local verification does not check the revocation list — use remote verification
+   * for sensitive operations such as payments or admin actions.
+   *
+   * When server keys are rotated, the SDK automatically detects the mismatch,
+   * refreshes the cached public key, and retries — no action needed on your end.
    *
    * @example
    * const { valid, payload } = await pqauth.verify(token)
@@ -329,7 +355,7 @@ export class PQAuth {
       const payload   = verifyLocally(token, publicKey)
       return { valid: true, payload, local: true }
     } catch (err) {
-      // Key mismatch may mean keys were rotated — invalidate cache and retry once
+      // On signature mismatch, keys may have been rotated — clear cache and retry once
       if (err instanceof PQAuthError && err.code === 'INVALID_SIGNATURE') {
         this.cachedKey = null
         try {
@@ -349,11 +375,15 @@ export class PQAuth {
 
   /**
    * Revoke a token immediately.
-   * Future verify() calls will reject it even if the signature is valid.
-   * Requires an API call even when localVerify is enabled.
+   *
+   * Future verify() calls will reject it even if the signature is valid
+   * and the token has not yet expired.
+   *
+   * Revocation always requires an API call, even when localVerify is enabled.
    *
    * @example
    * await pqauth.revoke(token, 'user logged out')
+   * await pqauth.revoke(token, 'suspicious activity detected')
    */
   async revoke(token: PQToken, reason?: string): Promise<RevokeResult> {
     return this.request<RevokeResult>('/revoke', {
@@ -365,8 +395,11 @@ export class PQAuth {
   // ── usage() ─────────────────────────────────────────────────────────────────
 
   /**
-   * Get current month usage and 6-month history.
-   * Usage is tracked globally per account — all projects share one monthly pool.
+   * Get current token balance and 6-month usage history.
+   *
+   * Free tokens reset on the 1st of each month (UTC) and do not accumulate.
+   * Pack tokens never expire and accumulate across purchases.
+   * All projects under the same account share a single pool.
    */
   async usage(): Promise<UsageResult> {
     return this.request<UsageResult>('/usage')
@@ -374,6 +407,18 @@ export class PQAuth {
 
   // ── webhooks ────────────────────────────────────────────────────────────────
 
+  /**
+   * Manage webhook configuration for real-time event notifications.
+   *
+   * Events: token.signed · token.rejected · token.revoked · limit.warning · limit.reached
+   *
+   * @example
+   * const { webhook } = await pqauth.webhooks.register({
+   *   url:    'https://yourapp.com/webhooks/pqauth',
+   *   events: ['limit.warning', 'limit.reached', 'token.revoked'],
+   * })
+   * console.log(webhook.secret) // store this — it won't be shown again
+   */
   readonly webhooks = {
     register: (options: { url: string; events?: WebhookEvent[] }): Promise<WebhookResult> =>
       this.request<WebhookResult>('/webhooks', { method: 'POST', body: JSON.stringify(options) }),
@@ -388,14 +433,20 @@ export class PQAuth {
       this.request('/webhooks/test', { method: 'POST' }),
   }
 
-  // ── middleware() — Node.js only ──────────────────────────────────────────────
+  // ── middleware() ─────────────────────────────────────────────────────────────
 
   /**
    * Express / Fastify middleware. Node.js only.
-   * Reads Authorization: Bearer <base64(token)> and attaches payload to req.user.
+   *
+   * Reads Authorization: Bearer <base64(token)> and attaches the decoded
+   * payload to req.user. Returns 401 if the token is missing or invalid.
    *
    * @example
    * app.use('/api', pqauth.middleware())
+   *
+   * app.get('/api/profile', (req, res) => {
+   *   res.json({ user: req.user })
+   * })
    */
   middleware() {
     return async (
@@ -412,7 +463,6 @@ export class PQAuth {
 
       let token: PQToken
       try {
-        // Use atob for browser/edge compatibility; Buffer fallback for older Node
         const b64     = headerValue.slice(7)
         const decoded = typeof atob !== 'undefined'
           ? atob(b64)
@@ -432,22 +482,26 @@ export class PQAuth {
     }
   }
 
-  // ── preloadPublicKey() ────────────────────────────────────────────────────────
+  // ── preloadPublicKey() ───────────────────────────────────────────────────────
 
   /**
    * Preload and cache the server's public key at startup.
+   *
    * Recommended when using localVerify: true to avoid first-request latency.
    *
    * @example
    * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true })
-   * await pqauth.preloadPublicKey()
+   * await pqauth.preloadPublicKey() // call once at startup
    */
   async preloadPublicKey(): Promise<void> {
     await this.getPublicKey()
   }
 
-  // ── health() ────────────────────────────────────────────────────────────────
+  // ── health() ─────────────────────────────────────────────────────────────────
 
+  /**
+   * Check the health of the PQAuth service.
+   */
   async health(): Promise<HealthResult> {
     const controller = new AbortController()
     const timer      = setTimeout(() => controller.abort(), this.timeout)
