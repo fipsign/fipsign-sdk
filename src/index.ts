@@ -1,5 +1,5 @@
 /**
- * pqauth-sdk v0.4.0
+ * pqauth-sdk v0.4.3
  *
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
@@ -71,8 +71,6 @@ export interface RevokeResult {
   message:   string
   revokedAt: number
   sub:       string
-  expiresAt: number
-  note:      string
 }
 
 export interface UsageResult {
@@ -116,10 +114,16 @@ export interface WebhookResult {
   }
 }
 
+export interface WebhookGetResult {
+  webhook: {
+    url:    string
+    events: WebhookEvent[]
+  } | null
+}
+
 export interface HealthResult {
   status:           string
   algorithm:        string
-  standard:         string
   quantumResistant: boolean
   version:          string
 }
@@ -355,7 +359,6 @@ export class PQAuth {
       const payload   = verifyLocally(token, publicKey)
       return { valid: true, payload, local: true }
     } catch (err) {
-      // On signature mismatch, keys may have been rotated — clear cache and retry once
       if (err instanceof PQAuthError && err.code === 'INVALID_SIGNATURE') {
         this.cachedKey = null
         try {
@@ -423,7 +426,7 @@ export class PQAuth {
     register: (options: { url: string; events?: WebhookEvent[] }): Promise<WebhookResult> =>
       this.request<WebhookResult>('/webhooks', { method: 'POST', body: JSON.stringify(options) }),
 
-    get: (): Promise<{ webhook: WebhookResult['webhook'] | null }> =>
+    get: (): Promise<WebhookGetResult> =>
       this.request('/webhooks'),
 
     delete: (): Promise<{ success: boolean }> =>

@@ -48,8 +48,8 @@ const { token, usage } = await pqauth.sign({
 
 // Sign an order
 const { token } = await pqauth.sign({
-  sub:    'order_456',
-  amount: 299.99,
+  sub:      'order_456',
+  amount:   299.99,
   currency: 'USD',
 })
 
@@ -146,7 +146,6 @@ app.post('/login', async (req, res) => {
   }
 
   const { token } = await pqauth.sign({ sub: user.id, email: user.email, role: user.role })
-  // Encode the token as base64 for the Authorization header
   const encoded = Buffer.from(JSON.stringify(token)).toString('base64')
   res.json({ token, encoded })
 })
