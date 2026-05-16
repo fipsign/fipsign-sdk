@@ -1,5 +1,5 @@
 /**
- * pqauth-sdk v0.4.0
+ * pqauth-sdk v0.4.3
  *
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
@@ -60,8 +60,6 @@ interface RevokeResult {
     message: string;
     revokedAt: number;
     sub: string;
-    expiresAt: number;
-    note: string;
 }
 interface UsageResult {
     current: {
@@ -98,10 +96,15 @@ interface WebhookResult {
         secret: string;
     };
 }
+interface WebhookGetResult {
+    webhook: {
+        url: string;
+        events: WebhookEvent[];
+    } | null;
+}
 interface HealthResult {
     status: string;
     algorithm: string;
-    standard: string;
     quantumResistant: boolean;
     version: string;
 }
@@ -202,9 +205,7 @@ declare class PQAuth {
             url: string;
             events?: WebhookEvent[];
         }) => Promise<WebhookResult>;
-        get: () => Promise<{
-            webhook: WebhookResult["webhook"] | null;
-        }>;
+        get: () => Promise<WebhookGetResult>;
         delete: () => Promise<{
             success: boolean;
         }>;
@@ -245,4 +246,4 @@ declare class PQAuth {
     health(): Promise<HealthResult>;
 }
 
-export { type HealthResult, type MiddlewareRequest, type MiddlewareResponse, type NextFunction, PQAuth, PQAuthError, type PQAuthOptions, type PQToken, type RevokeResult, type SignOptions, type SignResult, type TokenPayload, type UsageResult, type VerifyResult, type WebhookEvent, type WebhookResult, PQAuth as default };
+export { type HealthResult, type MiddlewareRequest, type MiddlewareResponse, type NextFunction, PQAuth, PQAuthError, type PQAuthOptions, type PQToken, type RevokeResult, type SignOptions, type SignResult, type TokenPayload, type UsageResult, type VerifyResult, type WebhookEvent, type WebhookGetResult, type WebhookResult, PQAuth as default };
