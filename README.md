@@ -27,9 +27,9 @@ Save the key — it will not be shown again.
 **3.** Use the key in your app:
 
 ```typescript
-import { FIPSign } from 'fipsign-sdk'
+import { PQAuth } from 'fipsign-sdk'
 
-const fipsign = new FIPSign('pqa_your_api_key')
+const fipsign = new PQAuth('pqa_your_api_key')
 ```
 ---
 
@@ -97,7 +97,7 @@ console.log(payload.exp)   // expiry timestamp (Unix)
 Enable `localVerify` to verify tokens entirely in memory — no API call, no network latency.
 
 ```typescript
-const fipsign = new FIPSign({
+const fipsign = new PQAuth({
   apiKey:      'pqa_your_api_key',
   localVerify: true,
 })
@@ -132,10 +132,10 @@ Reads `Authorization: Bearer <token>` and attaches the decoded payload to `req.u
 
 ```typescript
 import express from 'express'
-import { FIPSign } from 'fipsign-sdk'
+import { PQAuth } from 'fipsign-sdk'
 
-const app    = express()
-const fipsign = new FIPSign('pqa_your_api_key')
+const app     = express()
+const fipsign = new PQAuth('pqa_your_api_key')
 
 app.use(express.json())
 
@@ -248,12 +248,12 @@ app.post('/webhooks/fipsign', express.json(), (req, res) => {
 ## Error handling
 
 ```typescript
-import { FIPSign, FIPSignError } from 'fipsign-sdk'
+import { PQAuth, PQAuthError } from 'fipsign-sdk'
 
 try {
   await fipsign.sign({ sub: 'user_123' })
 } catch (err) {
-  if (err instanceof FIPSignError) {
+  if (err instanceof PQAuthError) {
     switch (err.code) {
       case 'INVALID_API_KEY':       // bad or missing API key
       case 'API_ERROR':             // server returned an error (check err.status)
@@ -282,7 +282,7 @@ Each operation costs 1 token: signing (`/sign`), verification (`/verify`), and r
 ## Constructor options
 
 ```typescript
-const fipsign = new FIPSign({
+const fipsign = new PQAuth({
   apiKey:      'pqa_...',   // required
   baseUrl:     'https://api.fipsign.dev', // optional, override for self-hosting
   timeout:     10_000,      // optional, ms (default: 10000)
