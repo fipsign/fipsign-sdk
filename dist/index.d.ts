@@ -1,6 +1,6 @@
 /**
- * pqauth-sdk v0.4.3
- *
+ * fipsign-sdk v0.5.0
+
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
  *

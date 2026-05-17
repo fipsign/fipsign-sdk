@@ -1,6 +1,6 @@
 /**
- * pqauth-sdk v0.4.3
- *
+ * fipsign-sdk v0.5.0
+
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
  *
@@ -206,19 +206,19 @@ export class PQAuth {
   constructor(options: PQAuthOptions | string) {
     if (typeof options === 'string') {
       this.apiKey      = options
-      this.baseUrl     = 'https://pqauth-core.gdbok.workers.dev'
+      this.baseUrl     = 'https://api.fipsign.dev'
       this.timeout     = 10_000
       this.localVerify = false
     } else {
       this.apiKey      = options.apiKey
-      this.baseUrl     = options.baseUrl     ?? 'https://pqauth-core.gdbok.workers.dev'
+      this.baseUrl     = options.baseUrl     ?? 'https://api.fipsign.dev'
       this.timeout     = options.timeout     ?? 10_000
       this.localVerify = options.localVerify ?? false
     }
 
     if (!this.apiKey?.startsWith('pqa_')) {
       throw new PQAuthError(
-        'Invalid API key — keys must start with "pqa_". Get one at https://pqauth-dashboard.pages.dev',
+        'Invalid API key — keys must start with "pqa_". Get one at https://app.fipsign.dev',
         'INVALID_API_KEY'
       )
     }

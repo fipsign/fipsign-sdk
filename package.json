@@ -1,7 +1,7 @@
 {
-  "name": "pqauth-sdk",
-  "version": "0.4.3",
-  "description": "Post-quantum authentication SDK — ML-DSA-65 (NIST FIPS 204)",
+  "name": "fipsign-sdk",
+  "version": "0.5.0",
+  "description": "Post-quantum signing SDK \u2014 ML-DSA-65 (NIST FIPS 204)",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -23,18 +23,17 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": [
-    "authentication",
+    "signing",
     "post-quantum",
     "ml-dsa",
     "quantum-resistant",
     "security",
-    "jwt",
     "token",
     "nist",
     "fips-204",
-    "auth"
+    "fipsign"
   ],
-  "author": "PQAuth",
+  "author": "FIPSign",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^25.6.2",

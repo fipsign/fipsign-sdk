@@ -61,18 +61,18 @@ var PQAuth = class {
     };
     if (typeof options === "string") {
       this.apiKey = options;
-      this.baseUrl = "https://pqauth-core.gdbok.workers.dev";
+      this.baseUrl = "https://api.fipsign.dev";
       this.timeout = 1e4;
       this.localVerify = false;
     } else {
       this.apiKey = options.apiKey;
-      this.baseUrl = options.baseUrl ?? "https://pqauth-core.gdbok.workers.dev";
+      this.baseUrl = options.baseUrl ?? "https://api.fipsign.dev";
       this.timeout = options.timeout ?? 1e4;
       this.localVerify = options.localVerify ?? false;
     }
     if (!this.apiKey?.startsWith("pqa_")) {
       throw new PQAuthError(
-        'Invalid API key \u2014 keys must start with "pqa_". Get one at https://pqauth-dashboard.pages.dev',
+        'Invalid API key \u2014 keys must start with "pqa_". Get one at https://app.fipsign.dev',
         "INVALID_API_KEY"
       );
     }

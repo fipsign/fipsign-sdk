@@ -1,4 +1,4 @@
-# pqauth-sdk
+# fipsign-sdk
 
 Post-quantum signing SDK for Node.js and the browser.
 
@@ -11,14 +11,14 @@ Signs and verifies any payload using **ML-DSA-65** (NIST FIPS 204) — the post-
 ## Install
 
 ```bash
-npm install pqauth-sdk
+npm install fipsign-sdk
 ```
 
 ---
 
 ## Quick start
 
-**1.** Create a free account at [pqauth-dashboard.pages.dev](https://pqauth-dashboard.pages.dev)
+**1.** Create a free account at [app.fipsign.dev](https://app.fipsign.dev)
 — enter your email, verify the OTP code sent to your inbox.
 
 **2.** In the dashboard, create a project, then create an API key inside that project.
@@ -27,9 +27,9 @@ Save the key — it will not be shown again.
 **3.** Use the key in your app:
 
 ```typescript
-import { PQAuth } from 'pqauth-sdk'
+import { FIPSign } from 'fipsign-sdk'
 
-const pqauth = new PQAuth('pqa_your_api_key')
+const fipsign = new FIPSign('pqa_your_api_key')
 ```
 ---
 
@@ -39,7 +39,7 @@ The only required field is `sub` — any string identifying the entity you want 
 
 ```typescript
 // Sign a user session
-const { token, usage } = await pqauth.sign({
+const { token, usage } = await fipsign.sign({
   sub:              'user_123',
   email:            'user@example.com',
   role:             'admin',
@@ -47,21 +47,21 @@ const { token, usage } = await pqauth.sign({
 })
 
 // Sign an order
-const { token } = await pqauth.sign({
+const { token } = await fipsign.sign({
   sub:      'order_456',
   amount:   299.99,
   currency: 'USD',
 })
 
 // Sign a document
-const { token } = await pqauth.sign({
+const { token } = await fipsign.sign({
   sub:      'doc_789',
   hash:     'sha256:abc...',
   signedBy: 'alice',
 })
 
 // Sign a device
-const { token } = await pqauth.sign({
+const { token } = await fipsign.sign({
   sub:      'device_iot_001',
   firmware: '2.1.4',
 })
@@ -79,7 +79,7 @@ console.log(`${usage.totalRemaining} total remaining`)
 Never throws. Returns `{ valid, payload }` or `{ valid: false, error }`.
 
 ```typescript
-const { valid, payload } = await pqauth.verify(token)
+const { valid, payload } = await fipsign.verify(token)
 
 if (!valid) {
   return res.status(401).json({ error: 'Unauthorized' })
@@ -97,15 +97,15 @@ console.log(payload.exp)   // expiry timestamp (Unix)
 Enable `localVerify` to verify tokens entirely in memory — no API call, no network latency.
 
 ```typescript
-const pqauth = new PQAuth({
+const fipsign = new FIPSign({
   apiKey:      'pqa_your_api_key',
   localVerify: true,
 })
 
 // Optional: preload public key at startup to avoid first-request latency
-await pqauth.preloadPublicKey()
+await fipsign.preloadPublicKey()
 
-const { valid, payload, local } = await pqauth.verify(token)
+const { valid, payload, local } = await fipsign.verify(token)
 console.log(local) // true — verified without an API call
 ```
 
@@ -120,8 +120,8 @@ When server keys are rotated, the SDK automatically detects the mismatch, refres
 Immediately invalidates a token. Future `verify()` calls will reject it even if the signature is valid and it hasn't expired.
 
 ```typescript
-await pqauth.revoke(token, 'user logged out')
-await pqauth.revoke(token, 'suspicious activity detected')
+await fipsign.revoke(token, 'user logged out')
+await fipsign.revoke(token, 'suspicious activity detected')
 ```
 
 ---
@@ -132,10 +132,10 @@ Reads `Authorization: Bearer <token>` and attaches the decoded payload to `req.u
 
 ```typescript
 import express from 'express'
-import { PQAuth } from 'pqauth-sdk'
+import { FIPSign } from 'fipsign-sdk'
 
 const app    = express()
-const pqauth = new PQAuth('pqa_your_api_key')
+const fipsign = new FIPSign('pqa_your_api_key')
 
 app.use(express.json())
 
@@ -145,19 +145,19 @@ app.post('/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid credentials' })
   }
 
-  const { token } = await pqauth.sign({ sub: user.id, email: user.email, role: user.role })
+  const { token } = await fipsign.sign({ sub: user.id, email: user.email, role: user.role })
   const encoded = Buffer.from(JSON.stringify(token)).toString('base64')
   res.json({ token, encoded })
 })
 
 app.post('/logout', async (req, res) => {
   const token = getTokenFromRequest(req)
-  if (token) await pqauth.revoke(token, 'user logged out')
+  if (token) await fipsign.revoke(token, 'user logged out')
   res.json({ success: true })
 })
 
 // Protect routes
-app.use('/api', pqauth.middleware())
+app.use('/api', fipsign.middleware())
 
 app.get('/api/profile', (req, res) => {
   res.json({ user: req.user })
@@ -171,7 +171,7 @@ app.get('/api/profile', (req, res) => {
 Free tokens reset on the 1st of each month (UTC). Pack tokens never expire and accumulate across purchases.
 
 ```typescript
-const { current, monthlyHistory, packs } = await pqauth.usage()
+const { current, monthlyHistory, packs } = await fipsign.usage()
 
 console.log(`Free: ${current.freeRemaining} / ${current.freeLimit}`)
 console.log(`Pack: ${current.packRemaining}`)
@@ -196,17 +196,17 @@ packs.forEach(({ packType, tokensPurchased, purchasedAt }) => {
 
 ```typescript
 // Register
-const { webhook } = await pqauth.webhooks.register({
-  url:    'https://yourapp.com/webhooks/pqauth',
+const { webhook } = await fipsign.webhooks.register({
+  url:    'https://yourapp.com/webhooks/fipsign',
   events: ['limit.warning', 'limit.reached', 'token.revoked'],
 })
 
 // Store webhook.secret securely — it won't be shown again
 console.log(webhook.secret)
 
-await pqauth.webhooks.test()                    // send a test event
-const { webhook: config } = await pqauth.webhooks.get()
-await pqauth.webhooks.delete()
+await fipsign.webhooks.test()                    // send a test event
+const { webhook: config } = await fipsign.webhooks.get()
+await fipsign.webhooks.delete()
 ```
 
 ### Verifying incoming webhook requests
@@ -214,10 +214,10 @@ await pqauth.webhooks.delete()
 ```typescript
 import crypto from 'crypto'
 
-app.post('/webhooks/pqauth', express.json(), (req, res) => {
+app.post('/webhooks/fipsign', express.json(), (req, res) => {
   const sig      = req.headers['x-pqauth-signature'] as string
   const expected = 'sha256=' + crypto
-    .createHmac('sha256', process.env.PQAUTH_WEBHOOK_SECRET!)
+    .createHmac('sha256', process.env.FIPSIGN_WEBHOOK_SECRET!)
     .update(JSON.stringify(req.body))
     .digest('hex')
 
@@ -248,12 +248,12 @@ app.post('/webhooks/pqauth', express.json(), (req, res) => {
 ## Error handling
 
 ```typescript
-import { PQAuth, PQAuthError } from 'pqauth-sdk'
+import { FIPSign, FIPSignError } from 'fipsign-sdk'
 
 try {
-  await pqauth.sign({ sub: 'user_123' })
+  await fipsign.sign({ sub: 'user_123' })
 } catch (err) {
-  if (err instanceof PQAuthError) {
+  if (err instanceof FIPSignError) {
     switch (err.code) {
       case 'INVALID_API_KEY':       // bad or missing API key
       case 'API_ERROR':             // server returned an error (check err.status)
@@ -282,9 +282,9 @@ Each operation costs 1 token: signing (`/sign`), verification (`/verify`), and r
 ## Constructor options
 
 ```typescript
-const pqauth = new PQAuth({
+const fipsign = new FIPSign({
   apiKey:      'pqa_...',   // required
-  baseUrl:     'https://pqauth-core.gdbok.workers.dev', // optional, override for self-hosting
+  baseUrl:     'https://api.fipsign.dev', // optional, override for self-hosting
   timeout:     10_000,      // optional, ms (default: 10000)
   localVerify: false,       // optional, enable in-memory verification (default: false)
 })
@@ -300,6 +300,6 @@ JWT with RS256/ES256 and standard OAuth tokens use ECDSA or RSA — both vulnera
 
 ## Links
 
-- Dashboard: [pqauth-dashboard.pages.dev](https://pqauth-dashboard.pages.dev)
-- API status: [pqauth-core.gdbok.workers.dev/health](https://pqauth-core.gdbok.workers.dev/health)
+- Dashboard: [app.fipsign.dev](https://app.fipsign.dev)
+- API status: [api.fipsign.dev/health](https://api.fipsign.dev/health)
 - NIST FIPS 204: [csrc.nist.gov/pubs/fips/204/final](https://csrc.nist.gov/pubs/fips/204/final)
