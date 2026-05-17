@@ -5,9 +5,9 @@
  * Usage: node test-sdk.mjs
  */
 
-import { PQAuth, PQAuthError } from 'pqauth-sdk'
+import { PQAuth, PQAuthError } from 'fipsign-sdk'
 
-const API_KEY = 'pqa_b7fa9e9da3761fe417b78d894a1910363a91ad453f6567b7d31ef70ed4270a64'
+const API_KEY = 'pqa_04cf0c1b8e567aa372ae17338a5d9816de4644219e6498b1d5b863ed7826a753'
 
 const GREEN  = '\x1b[32m'
 const RED    = '\x1b[31m'
@@ -41,8 +41,8 @@ function section(title) {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 async function run() {
-  console.log('\n' + BOLD + 'PQSign SDK — Integration Test' + RESET)
-  console.log(DIM + 'pqauth-sdk@0.4.3 · ' + new Date().toISOString() + RESET + '\n')
+  console.log('\n' + BOLD + 'FIPSign SDK — Integration Test' + RESET)
+  console.log(DIM + 'fipsign-sdk@0.5.1 · ' + new Date().toISOString() + RESET + '\n')
 
   const pq = new PQAuth(API_KEY)
 
@@ -259,6 +259,106 @@ async function run() {
     log('historyMonths', String(r.monthlyHistory.length))
     pass('usage() — correct shape, 6-month history present')
   } catch (err) { fail('usage()', err) }
+
+
+  // 09 Local verify does NOT detect revoked tokens
+  section('09 · Local verify — revoked token passes (expected behavior)')
+  try {
+    const r = await pq.sign({ sub: 'revoke_local_test', expiresInSeconds: 3600 })
+    const token = r.token
+    await pq.revoke(token, 'test revocation for local verify')
+    const remote = await pq.verify(token)
+    if (remote.valid) throw new Error('remote verify should reject revoked token')
+    pass('revoke() — remote verify rejects revoked token')
+
+    const localResult = await pqLocal.verify(token)
+    if (!localResult.valid) throw new Error('local verify should NOT check revocation list — expected valid:true')
+    if (localResult.local !== true) throw new Error('local should be true')
+    log('valid (local)', String(localResult.valid))
+    log('local',         String(localResult.local))
+    pass('verify() local — revoked token passes (does not check revocation list — use remote for sensitive ops)')
+  } catch (err) { fail('local verify revoked token test', err) }
+
+  // 10 sign() without expiresInSeconds — defaults to 1 hour
+  section('10 · sign() — default expiry (no expiresInSeconds)')
+  try {
+    const r = await pq.sign({ sub: 'default_expiry_test' })
+    const payload = JSON.parse(Buffer.from(r.token.payload, 'base64').toString('utf8'))
+    const expectedExp = payload.iat + 3600
+    const diff = Math.abs(payload.exp - expectedExp)
+    if (diff > 5) throw new Error('exp is ' + payload.exp + ', expected ~' + expectedExp + ' (1 hour from iat)')
+    log('iat',          String(payload.iat))
+    log('exp',          String(payload.exp))
+    log('diff from 1h', String(diff) + 's')
+    pass('sign() — default expiresInSeconds is 3600 (1 hour)')
+  } catch (err) { fail('sign() default expiry', err) }
+
+  // 11 verify() with malformed token
+  section('11 · verify() — malformed token shapes')
+  try {
+    const r = await pq.verify({ payload: '', signature: '', algorithm: 'ML-DSA-65', issuedAt: 0 })
+    if (r.valid) throw new Error('should be invalid')
+    if (!r.error) throw new Error('missing error message')
+    log('valid', String(r.valid))
+    log('error', r.error)
+    pass('verify() empty payload/signature — returns valid:false without throwing')
+  } catch (err) { fail('verify() empty payload/signature', err) }
+
+  try {
+    const r = await pq.verify({ payload: 'abc', signature: 'xyz', algorithm: 'UNKNOWN-ALG', issuedAt: 0 })
+    if (r.valid) throw new Error('should be invalid')
+    if (!r.error) throw new Error('missing error message')
+    log('valid', String(r.valid))
+    log('error', r.error)
+    pass('verify() unknown algorithm — returns valid:false without throwing')
+  } catch (err) { fail('verify() unknown algorithm', err) }
+
+  try {
+    const r = await pq.verify({})
+    if (r.valid) throw new Error('should be invalid')
+    log('valid', String(r.valid))
+    pass('verify() empty object — returns valid:false without throwing')
+  } catch (err) { fail('verify() empty object', err) }
+
+  // 12 Webhooks
+  section('12 · webhooks — register, get, test, delete')
+  try {
+    const { webhook } = await pq.webhooks.register({
+      url:    'https://httpbin.org/post',
+      events: ['token.signed', 'limit.warning'],
+    })
+    if (!webhook.url)    throw new Error('missing webhook.url')
+    if (!webhook.secret) throw new Error('missing webhook.secret')
+    if (!Array.isArray(webhook.events)) throw new Error('events is not an array')
+    log('url',    webhook.url)
+    log('events', webhook.events.join(', '))
+    log('secret', webhook.secret.slice(0, 8) + '...')
+    pass('webhooks.register() — webhook created with secret')
+  } catch (err) { fail('webhooks.register()', err) }
+
+  try {
+    const { webhook } = await pq.webhooks.get()
+    if (!webhook) throw new Error('webhook is null')
+    if (!webhook.url) throw new Error('missing webhook.url')
+    if (!Array.isArray(webhook.events)) throw new Error('events is not an array')
+    log('url',    webhook.url)
+    log('events', webhook.events.join(', '))
+    pass('webhooks.get() — returns active webhook without secret')
+  } catch (err) { fail('webhooks.get()', err) }
+
+  try {
+    const r = await pq.webhooks.test()
+    if (!r.message) throw new Error('missing message')
+    log('message', r.message)
+    pass('webhooks.test() — test event dispatched')
+  } catch (err) { fail('webhooks.test()', err) }
+
+  try {
+    await pq.webhooks.delete()
+    const { webhook } = await pq.webhooks.get()
+    if (webhook !== null) throw new Error('webhook should be null after delete')
+    pass('webhooks.delete() — webhook removed, get() returns null')
+  } catch (err) { fail('webhooks.delete()', err) }
 
   // Summary
   const total = passed + failed
