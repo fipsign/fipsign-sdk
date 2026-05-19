@@ -1,13 +1,43 @@
 /**
- * PQSign SDK — Integration test
- * Runs against the live backend using the published pqauth-sdk@0.4.3
+ * FIPSign SDK — Integration test
+ * Runs against the live backend using the published fipsign-sdk
  *
- * Usage: node test-sdk.mjs
+ * Usage:
+ *   FIPSIGN_API_KEY=pqa_...              \
+ *   WEBHOOK_URL=https://webhook.site/... \
+ *   WEBHOOK_SITE_TOKEN=your-uuid         \
+ *   node test-sdk.mjs
+ *
+ * Prerequisites:
+ *   1. Create a free account at https://app.fipsign.dev
+ *   2. Create a project and an API key inside that project
+ *   3. Create a free endpoint at https://webhook.site and copy your UUID
+ *   4. npm install fipsign-sdk
  */
 
 import { PQAuth, PQAuthError } from 'fipsign-sdk'
+import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js'
 
-const API_KEY = 'pqa_04cf0c1b8e567aa372ae17338a5d9816de4644219e6498b1d5b863ed7826a753'
+// ─── Required environment variables ───────────────────────────────────────────
+
+const API_KEY            = process.env.FIPSIGN_API_KEY
+const WEBHOOK_URL        = process.env.WEBHOOK_URL
+const WEBHOOK_SITE_TOKEN = process.env.WEBHOOK_SITE_TOKEN
+
+if (!API_KEY) {
+  console.error('\x1b[31mError: FIPSIGN_API_KEY is required.\x1b[0m')
+  console.error('Get your API key at https://app.fipsign.dev')
+  process.exit(1)
+}
+if (!WEBHOOK_URL || !WEBHOOK_SITE_TOKEN) {
+  console.error('\x1b[31mError: WEBHOOK_URL and WEBHOOK_SITE_TOKEN are required.\x1b[0m')
+  console.error('Create a free endpoint at https://webhook.site and copy your UUID.')
+  console.error('  WEBHOOK_URL=https://webhook.site/<your-uuid>')
+  console.error('  WEBHOOK_SITE_TOKEN=<your-uuid>')
+  process.exit(1)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const GREEN  = '\x1b[32m'
 const RED    = '\x1b[31m'
@@ -40,13 +70,22 @@ function section(title) {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+function fromBase64(b64) {
+  const binary = atob(b64)
+  const bytes  = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+// ─── Run ──────────────────────────────────────────────────────────────────────
+
 async function run() {
   console.log('\n' + BOLD + 'FIPSign SDK — Integration Test' + RESET)
-  console.log(DIM + 'fipsign-sdk@0.5.1 · ' + new Date().toISOString() + RESET + '\n')
+  console.log(DIM + 'fipsign-sdk@0.5.2 · ' + new Date().toISOString() + RESET + '\n')
 
   const pq = new PQAuth(API_KEY)
 
-  // 01 Health
+  // ─── 01 Health ──────────────────────────────────────────────────────────────
   section('01 · Health check')
   try {
     const h = await pq.health()
@@ -61,7 +100,7 @@ async function run() {
     pass('health() returns correct fields')
   } catch (err) { fail('health()', err) }
 
-  // 02 Invalid API key
+  // ─── 02 Invalid API key ──────────────────────────────────────────────────────
   section('02 · Invalid API key rejection')
   try {
     new PQAuth('bad_key')
@@ -74,25 +113,32 @@ async function run() {
     }
   }
 
-  // 03 Sign
+  // ─── 03 sign() ───────────────────────────────────────────────────────────────
   section('03 · sign()')
   let userToken, orderToken, docToken
 
   try {
-    const r = await pq.sign({ sub: 'user_test', email: 'test@pqsign.io', role: 'admin', expiresInSeconds: 3600 })
+    const r = await pq.sign({ sub: 'user_test', email: 'test@example.com', role: 'admin', expiresInSeconds: 3600 })
     if (!r.token?.payload)   throw new Error('missing token.payload')
     if (!r.token?.signature) throw new Error('missing token.signature')
     if (r.token.algorithm !== 'ML-DSA-65') throw new Error('wrong algorithm: ' + r.token.algorithm)
     if (r.meta.tokenCost !== 1) throw new Error('tokenCost is ' + r.meta.tokenCost + ', expected 1')
-    if (!['free','pack','free+pack'].includes(r.meta.source)) throw new Error('unexpected source: ' + r.meta.source)
+    if (!['free', 'pack', 'free+pack'].includes(r.meta.source)) throw new Error('unexpected source: ' + r.meta.source)
+    if (!r.meta.projectId)  throw new Error('missing meta.projectId')
+    if (!r.meta.issuedFor)  throw new Error('missing meta.issuedFor')
+    if (r.meta.expiresIn !== 3600) throw new Error('meta.expiresIn is ' + r.meta.expiresIn + ', expected 3600')
     if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage.freeRemaining')
-    log('sub',           'user_test')
+    if (typeof r.usage.packRemaining !== 'number') throw new Error('missing usage.packRemaining')
+    if (typeof r.usage.totalRemaining !== 'number') throw new Error('missing usage.totalRemaining')
+    if (!r.usage.month) throw new Error('missing usage.month')
     log('algorithm',     r.token.algorithm)
     log('tokenCost',     String(r.meta.tokenCost))
     log('source',        r.meta.source)
+    log('expiresIn',     String(r.meta.expiresIn))
+    log('usage.month',   r.usage.month)
     log('freeRemaining', String(r.usage.freeRemaining))
     userToken = r.token
-    pass('sign() user session — correct shape and fields')
+    pass('sign() user session — correct shape and all fields present')
   } catch (err) { fail('sign() user session', err) }
 
   try {
@@ -115,16 +161,42 @@ async function run() {
 
   try {
     await pq.sign({ sub: '' })
-    fail('sign() rejects missing sub', new Error('should have thrown'))
+    fail('sign() rejects empty sub', new Error('should have thrown'))
   } catch (err) {
     if (err instanceof PQAuthError && err.code === 'MISSING_SUB') {
       pass('sign() throws PQAuthError(MISSING_SUB) when sub is empty')
+    } else {
+      fail('sign() rejects empty sub', err)
+    }
+  }
+
+  try {
+    await pq.sign({})
+    fail('sign() rejects missing sub', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'MISSING_SUB') {
+      pass('sign() throws PQAuthError(MISSING_SUB) when sub is missing')
     } else {
       fail('sign() rejects missing sub', err)
     }
   }
 
-  // 04 Verify remote
+  try {
+    await pq.sign({
+      sub: 'test_fields',
+      f1: 'a', f2: 'b', f3: 'c', f4: 'd', f5: 'e',
+      f6: 'f', f7: 'g', f8: 'h', f9: 'i', f10: 'j', f11: 'k',
+    })
+    fail('sign() rejects >10 custom fields', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'API_ERROR' && err.status === 400) {
+      pass('sign() throws API_ERROR(400) when >10 custom fields')
+    } else {
+      fail('sign() rejects >10 custom fields', err)
+    }
+  }
+
+  // ─── 04 verify() remote ──────────────────────────────────────────────────────
   section('04 · verify() — remote')
 
   if (userToken) {
@@ -134,10 +206,14 @@ async function run() {
       if (!r.payload?.sub)     throw new Error('missing payload.sub')
       if (r.payload.sub !== 'user_test') throw new Error('sub is "' + r.payload.sub + '", expected "user_test"')
       if (r.payload.role !== 'admin')    throw new Error('role is "' + r.payload.role + '", expected "admin"')
+      if (typeof r.payload.iat !== 'number') throw new Error('missing payload.iat')
+      if (typeof r.payload.exp !== 'number') throw new Error('missing payload.exp')
       if (r.local !== false)   throw new Error('local should be false for remote verify')
       log('valid', String(r.valid))
       log('sub',   r.payload.sub)
       log('role',  String(r.payload.role))
+      log('iat',   String(r.payload.iat))
+      log('exp',   String(r.payload.exp))
       log('local', String(r.local))
       pass('verify() valid token — correct payload returned')
     } catch (err) { fail('verify() valid token', err) }
@@ -165,7 +241,7 @@ async function run() {
     } catch (err) { fail('verify() order token', err) }
   }
 
-  // 05 Local verify
+  // ─── 05 verify() local ───────────────────────────────────────────────────────
   section('05 · verify() — local (offline)')
 
   const pqLocal = new PQAuth({ apiKey: API_KEY, localVerify: true })
@@ -198,21 +274,26 @@ async function run() {
     } catch (err) { fail('verify() local — tampered token', err) }
   }
 
-  // 06 Revoke
+  // ─── 06 revoke() ─────────────────────────────────────────────────────────────
   section('06 · revoke()')
   let revokedToken
 
   if (docToken) {
     try {
       const r = await pq.revoke(docToken, 'integration test')
-      if (!r.success) throw new Error('success is false')
-      if (!r.message) throw new Error('missing message')
+      if (!r.success)   throw new Error('success is false')
+      if (!r.message)   throw new Error('missing message')
       if (r.sub !== 'doc_789') throw new Error('sub is "' + r.sub + '", expected "doc_789"')
-      log('success', String(r.success))
-      log('message', r.message)
-      log('sub',     r.sub)
+      if (typeof r.revokedAt !== 'number') throw new Error('missing revokedAt')
+      if (typeof r.expiresAt !== 'number') throw new Error('missing expiresAt')
+      if (!r.note)      throw new Error('missing note')
+      log('success',   String(r.success))
+      log('message',   r.message)
+      log('sub',       r.sub)
+      log('revokedAt', String(r.revokedAt))
+      log('expiresAt', String(r.expiresAt))
       revokedToken = docToken
-      pass('revoke() — token revoked successfully')
+      pass('revoke() — token revoked, all fields present')
     } catch (err) { fail('revoke()', err) }
   }
 
@@ -221,13 +302,35 @@ async function run() {
       const r = await pq.verify(revokedToken)
       if (r.valid)  throw new Error('valid should be false for revoked token')
       if (!r.error) throw new Error('missing error message')
+      if (r.error !== 'Token has been revoked') throw new Error('unexpected error: ' + r.error)
       log('valid', String(r.valid))
       log('error', r.error)
-      pass('verify() revoked token — returns valid:false')
+      pass('verify() revoked token — returns valid:false with correct error')
     } catch (err) { fail('verify() after revoke', err) }
+
+    try {
+      const r = await pq.revoke(revokedToken, 'second revoke attempt')
+      if (!r.success) throw new Error('success should be true')
+      if (!r.message) throw new Error('missing message')
+      log('message', r.message)
+      pass('revoke() idempotent — revoking already-revoked token returns success')
+    } catch (err) { fail('revoke() idempotent', err) }
   }
 
-  // 07 Expired token
+  try {
+    const r = await pq.sign({ sub: 'expire_revoke_test', expiresInSeconds: 1 })
+    await sleep(2000)
+    await pq.revoke(r.token, 'revoke after expiry')
+    fail('revoke() expired token returns 400', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'API_ERROR' && err.status === 400) {
+      pass('revoke() expired token — throws API_ERROR(400)')
+    } else {
+      fail('revoke() expired token returns 400', err)
+    }
+  }
+
+  // ─── 07 Expired token ────────────────────────────────────────────────────────
   section('07 · Expired token')
   try {
     const r = await pq.sign({ sub: 'expiry_test', expiresInSeconds: 1 })
@@ -242,44 +345,50 @@ async function run() {
     pass('verify() expired token — returns valid:false')
   } catch (err) { fail('expired token test', err) }
 
-  // 08 Usage
+  // ─── 08 usage() ──────────────────────────────────────────────────────────────
   section('08 · usage()')
   try {
     const r = await pq.usage()
-    if (!r.current?.month)                           throw new Error('missing current.month')
-    if (typeof r.current.freeRemaining !== 'number') throw new Error('missing freeRemaining')
-    if (typeof r.current.freeLimit !== 'number')     throw new Error('missing freeLimit')
-    if (!Array.isArray(r.monthlyHistory))            throw new Error('monthlyHistory is not an array')
-    if (r.monthlyHistory.length !== 6)               throw new Error('monthlyHistory has ' + r.monthlyHistory.length + ' entries, expected 6')
-    if (!Array.isArray(r.packs))                     throw new Error('packs is not an array')
-    log('month',         r.current.month)
-    log('freeRemaining', String(r.current.freeRemaining))
-    log('freeLimit',     String(r.current.freeLimit))
-    log('packRemaining', String(r.current.packRemaining))
-    log('historyMonths', String(r.monthlyHistory.length))
-    pass('usage() — correct shape, 6-month history present')
+    if (!r.current?.month)                            throw new Error('missing current.month')
+    if (typeof r.current.freeUsed !== 'number')       throw new Error('missing current.freeUsed')
+    if (typeof r.current.freeRemaining !== 'number')  throw new Error('missing current.freeRemaining')
+    if (typeof r.current.freeLimit !== 'number')      throw new Error('missing current.freeLimit')
+    if (typeof r.current.packRemaining !== 'number')  throw new Error('missing current.packRemaining')
+    if (typeof r.current.totalRemaining !== 'number') throw new Error('missing current.totalRemaining')
+    if (!Array.isArray(r.monthlyHistory))             throw new Error('monthlyHistory is not an array')
+    if (r.monthlyHistory.length !== 6)                throw new Error('monthlyHistory has ' + r.monthlyHistory.length + ' entries, expected 6')
+    if (!Array.isArray(r.packs))                      throw new Error('packs is not an array')
+    if (!r.developer?.email)                          throw new Error('missing developer.email')
+    log('month',          r.current.month)
+    log('freeUsed',       String(r.current.freeUsed))
+    log('freeRemaining',  String(r.current.freeRemaining))
+    log('freeLimit',      String(r.current.freeLimit))
+    log('packRemaining',  String(r.current.packRemaining))
+    log('totalRemaining', String(r.current.totalRemaining))
+    log('historyMonths',  String(r.monthlyHistory.length))
+    pass('usage() — correct shape, all fields present, 6-month history')
   } catch (err) { fail('usage()', err) }
 
-
-  // 09 Local verify does NOT detect revoked tokens
+  // ─── 09 Local verify — revoked token passes (expected behavior) ──────────────
   section('09 · Local verify — revoked token passes (expected behavior)')
   try {
     const r = await pq.sign({ sub: 'revoke_local_test', expiresInSeconds: 3600 })
     const token = r.token
     await pq.revoke(token, 'test revocation for local verify')
+
     const remote = await pq.verify(token)
     if (remote.valid) throw new Error('remote verify should reject revoked token')
     pass('revoke() — remote verify rejects revoked token')
 
     const localResult = await pqLocal.verify(token)
-    if (!localResult.valid) throw new Error('local verify should NOT check revocation list — expected valid:true')
+    if (!localResult.valid)         throw new Error('local verify should NOT check revocation — expected valid:true')
     if (localResult.local !== true) throw new Error('local should be true')
     log('valid (local)', String(localResult.valid))
     log('local',         String(localResult.local))
     pass('verify() local — revoked token passes (does not check revocation list — use remote for sensitive ops)')
   } catch (err) { fail('local verify revoked token test', err) }
 
-  // 10 sign() without expiresInSeconds — defaults to 1 hour
+  // ─── 10 Default expiry ───────────────────────────────────────────────────────
   section('10 · sign() — default expiry (no expiresInSeconds)')
   try {
     const r = await pq.sign({ sub: 'default_expiry_test' })
@@ -293,11 +402,11 @@ async function run() {
     pass('sign() — default expiresInSeconds is 3600 (1 hour)')
   } catch (err) { fail('sign() default expiry', err) }
 
-  // 11 verify() with malformed token
+  // ─── 11 Malformed tokens ─────────────────────────────────────────────────────
   section('11 · verify() — malformed token shapes')
   try {
     const r = await pq.verify({ payload: '', signature: '', algorithm: 'ML-DSA-65', issuedAt: 0 })
-    if (r.valid) throw new Error('should be invalid')
+    if (r.valid)  throw new Error('should be invalid')
     if (!r.error) throw new Error('missing error message')
     log('valid', String(r.valid))
     log('error', r.error)
@@ -306,7 +415,7 @@ async function run() {
 
   try {
     const r = await pq.verify({ payload: 'abc', signature: 'xyz', algorithm: 'UNKNOWN-ALG', issuedAt: 0 })
-    if (r.valid) throw new Error('should be invalid')
+    if (r.valid)  throw new Error('should be invalid')
     if (!r.error) throw new Error('missing error message')
     log('valid', String(r.valid))
     log('error', r.error)
@@ -320,15 +429,24 @@ async function run() {
     pass('verify() empty object — returns valid:false without throwing')
   } catch (err) { fail('verify() empty object', err) }
 
-  // 12 Webhooks
-  section('12 · webhooks — register, get, test, delete')
+  // ─── 12 Webhooks ─────────────────────────────────────────────────────────────
+  section('12 · webhooks — get before register, register, get, test, delete')
+
+  try {
+    await pq.webhooks.delete().catch(() => {})
+    const { webhook } = await pq.webhooks.get()
+    if (webhook !== null) throw new Error('webhook should be null before registering')
+    log('webhook', 'null')
+    pass('webhooks.get() before register — returns null')
+  } catch (err) { fail('webhooks.get() before register', err) }
+
   try {
     const { webhook } = await pq.webhooks.register({
-      url:    'https://httpbin.org/post',
+      url:    WEBHOOK_URL,
       events: ['token.signed', 'limit.warning'],
     })
-    if (!webhook.url)    throw new Error('missing webhook.url')
-    if (!webhook.secret) throw new Error('missing webhook.secret')
+    if (!webhook.url)                   throw new Error('missing webhook.url')
+    if (!webhook.secret)                throw new Error('missing webhook.secret')
     if (!Array.isArray(webhook.events)) throw new Error('events is not an array')
     log('url',    webhook.url)
     log('events', webhook.events.join(', '))
@@ -338,12 +456,13 @@ async function run() {
 
   try {
     const { webhook } = await pq.webhooks.get()
-    if (!webhook) throw new Error('webhook is null')
-    if (!webhook.url) throw new Error('missing webhook.url')
+    if (!webhook)                       throw new Error('webhook is null after register')
+    if (!webhook.url)                   throw new Error('missing webhook.url')
     if (!Array.isArray(webhook.events)) throw new Error('events is not an array')
+    if (webhook.secret)                 throw new Error('secret should not be returned by get()')
     log('url',    webhook.url)
     log('events', webhook.events.join(', '))
-    pass('webhooks.get() — returns active webhook without secret')
+    pass('webhooks.get() — returns webhook without secret')
   } catch (err) { fail('webhooks.get()', err) }
 
   try {
@@ -360,7 +479,92 @@ async function run() {
     pass('webhooks.delete() — webhook removed, get() returns null')
   } catch (err) { fail('webhooks.delete()', err) }
 
-  // Summary
+  // ─── 13 Independent ML-DSA-65 signature verification ─────────────────────────
+  section('13 · Independent ML-DSA-65 signature verification')
+  try {
+    const pkResp = await fetch('https://api.fipsign.dev/public-key')
+    const pkData = await pkResp.json()
+    if (!pkData.publicKey) throw new Error('could not fetch public key')
+
+    const { token } = await pq.sign({ sub: 'crypto_verify_test', expiresInSeconds: 3600 })
+
+    const publicKey = fromBase64(pkData.publicKey)
+    const signature = fromBase64(token.signature)
+    const message   = new TextEncoder().encode(token.payload)
+
+    const isValid = ml_dsa65.verify(signature, message, publicKey)
+    if (!isValid) throw new Error('ML-DSA-65 signature is mathematically invalid')
+
+    log('algorithm', pkData.algorithm)
+    log('verified',  'via @noble/post-quantum directly (no SDK verify())')
+    log('result',    'valid ✓')
+    pass('ML-DSA-65 signature verified independently — cryptography is correct')
+  } catch (err) { fail('independent ML-DSA-65 verification', err) }
+
+  // ─── 14 Distinct signatures for identical payloads ───────────────────────────
+  section('14 · Distinct signatures for identical payloads')
+  try {
+    const payload = { sub: 'replay_test', role: 'admin', expiresInSeconds: 3600 }
+    const r1 = await pq.sign(payload)
+    const r2 = await pq.sign(payload)
+
+    if (r1.token.signature === r2.token.signature) {
+      throw new Error('signatures are identical — possible replay attack vulnerability')
+    }
+    if (r1.token.payload === r2.token.payload) {
+      throw new Error('payloads are identical — iat should differ between calls')
+    }
+
+    log('signature1', r1.token.signature.slice(0, 24) + '...')
+    log('signature2', r2.token.signature.slice(0, 24) + '...')
+    log('distinct',   'yes ✓')
+    pass('signing same payload twice produces distinct signatures — no replay vulnerability')
+  } catch (err) { fail('distinct signatures test', err) }
+
+  // ─── 15 Webhook delivery confirmation ────────────────────────────────────────
+  section('15 · Webhook delivery confirmation')
+  try {
+    await pq.webhooks.delete().catch(() => {})
+    await pq.webhooks.register({ url: WEBHOOK_URL, events: ['token.signed'] })
+
+    const uniqueSub = 'webhook_delivery_test_' + Date.now()
+    await pq.sign({ sub: uniqueSub, expiresInSeconds: 300 })
+
+    console.log('  ' + DIM + 'Waiting 3 seconds for webhook delivery...' + RESET)
+    await sleep(3000)
+
+    const whResp = await fetch(
+      'https://webhook.site/token/' + WEBHOOK_SITE_TOKEN + '/requests?sorting=newest&per_page=5',
+      { headers: { 'Accept': 'application/json' } }
+    )
+
+    if (!whResp.ok) throw new Error('webhook.site API returned ' + whResp.status)
+
+    const whData   = await whResp.json()
+    const requests = whData.data ?? []
+
+    if (requests.length === 0) throw new Error('no requests received at webhook.site')
+
+    const found = requests.find(req => {
+      try {
+        const body = typeof req.content === 'string' ? JSON.parse(req.content) : req.content
+        return body?.event === 'token.signed' && body?.data?.sub === uniqueSub
+      } catch { return false }
+    })
+
+    if (!found) throw new Error('event for sub "' + uniqueSub + '" not found in recent requests')
+
+    const body = typeof found.content === 'string' ? JSON.parse(found.content) : found.content
+    log('event',     body.event)
+    log('sub',       body.data.sub)
+    log('timestamp', String(body.timestamp))
+    log('delivered', 'yes ✓')
+    pass('webhook delivered and confirmed — event arrived with correct payload')
+
+    await pq.webhooks.delete()
+  } catch (err) { fail('webhook delivery confirmation', err) }
+
+  // ─── Summary ──────────────────────────────────────────────────────────────────
   const total = passed + failed
   console.log('\n' + '─'.repeat(48))
   console.log(BOLD + 'Results: ' + passed + '/' + total + ' passed' + RESET)
