@@ -33,6 +33,10 @@
     "fips-204",
     "fipsign"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fipsign/fipsign-sdk"
+  },
   "author": "FIPSign",
   "license": "MIT",
   "devDependencies": {
