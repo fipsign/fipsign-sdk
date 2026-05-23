@@ -35,7 +35,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/fipsign/fipsign-sdk"
+    "url": "git+https://github.com/fipsign/fipsign-sdk.git"
   },
   "author": "FIPSign",
   "license": "MIT",
