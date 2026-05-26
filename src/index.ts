@@ -1,6 +1,6 @@
 /**
- * fipsign-sdk v0.5.0
-
+ * fipsign-sdk v0.6.0
+ *
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
  *
@@ -128,6 +128,91 @@ export interface HealthResult {
   version:          string
 }
 
+// ─── Certificate Authority types ──────────────────────────────────────────────
+
+export interface PQCert {
+  type:       'CA_ROOT' | 'CA_CERT'
+  id:         string
+  subject:    string
+  publicKey:  string
+  caId?:      string
+  issuedAt:   number
+  expiresAt?: number
+  algorithm:  'ML-DSA-65'
+  standard:   'NIST FIPS 204'
+  meta?:      Record<string, unknown>
+  signature:  string
+}
+
+export interface CaIssueCertOptions {
+  subject:          string
+  publicKey:        string
+  expiresInSeconds: number
+  meta?:            Record<string, unknown>
+}
+
+export interface CaIssueCertResult {
+  certificate: PQCert
+  meta: {
+    certId:    string
+    caId:      string
+    subject:   string
+    issuedAt:  number
+    expiresAt: number
+    algorithm: string
+    standard:  string
+  }
+  usage: {
+    freeRemaining:  number
+    packRemaining:  number
+    totalRemaining: number
+  }
+}
+
+export interface CaRevokeCertResult {
+  certId:    string
+  revokedAt: number
+  reason:    string | null
+  usage: {
+    freeRemaining:  number
+    packRemaining:  number
+    totalRemaining: number
+  }
+}
+
+export interface CaCertStatus {
+  revoked:   boolean
+  expired:   boolean
+  revokedAt: number | null
+  expiresAt: number
+}
+
+export interface CaGetCertResult {
+  certificate: PQCert
+  status:      CaCertStatus
+}
+
+export interface CrlEntry {
+  certId:    string
+  revokedAt: number
+  reason:    string | null
+}
+
+export interface CaGetCrlResult {
+  caId:        string
+  subject:     string
+  crl:         CrlEntry[]
+  generatedAt: number
+}
+
+export interface VerifyCertResult {
+  valid:  boolean
+  cert?:  PQCert
+  error?: string
+}
+
+// ─── Middleware types ─────────────────────────────────────────────────────────
+
 export interface MiddlewareRequest {
   headers: { [key: string]: string | string[] | undefined }
 }
@@ -152,7 +237,7 @@ export class PQAuthError extends Error {
   }
 }
 
-// ─── Local verification helpers ───────────────────────────────────────────────
+// ─── Crypto helpers ───────────────────────────────────────────────────────────
 
 function fromBase64(b64: string): Uint8Array {
   const binary = atob(b64)
@@ -160,6 +245,14 @@ function fromBase64(b64: string): Uint8Array {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
   return bytes
 }
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+  return btoa(binary)
+}
+
+// ─── Local token verification ─────────────────────────────────────────────────
 
 function verifyLocally(token: PQToken, publicKeyB64: string): TokenPayload {
   if (token.algorithm !== 'ML-DSA-65') {
@@ -187,6 +280,70 @@ function verifyLocally(token: PQToken, publicKeyB64: string): TokenPayload {
   return payload
 }
 
+// ─── Local certificate verification ──────────────────────────────────────────
+
+function verifyCertLocally(cert: PQCert, rootCert: PQCert): void {
+  if (cert.type !== 'CA_CERT') {
+    throw new PQAuthError('Expected a CA_CERT, got ' + cert.type, 'INVALID_CERT_TYPE')
+  }
+  if (rootCert.type !== 'CA_ROOT') {
+    throw new PQAuthError('Expected a CA_ROOT, got ' + rootCert.type, 'INVALID_CERT_TYPE')
+  }
+  if (cert.caId !== rootCert.id) {
+    throw new PQAuthError('Certificate was not issued by this CA', 'CA_MISMATCH')
+  }
+
+  const now = Math.floor(Date.now() / 1000)
+  if (cert.expiresAt !== undefined && cert.expiresAt < now) {
+    throw new PQAuthError(
+      `Certificate expired ${now - cert.expiresAt} seconds ago`,
+      'CERT_EXPIRED'
+    )
+  }
+
+  const { signature, ...certWithoutSig } = cert
+  const canonical = JSON.stringify(certWithoutSig, Object.keys(certWithoutSig).sort())
+  const msgBytes  = new TextEncoder().encode(canonical)
+  const sigBytes  = fromBase64(signature)
+  const pubKey    = fromBase64(rootCert.publicKey)
+
+  const isValid = ml_dsa65.verify(sigBytes, msgBytes, pubKey)
+  if (!isValid) {
+    throw new PQAuthError(
+      'Invalid certificate signature — not issued by this CA',
+      'INVALID_CERT_SIGNATURE'
+    )
+  }
+}
+
+// ─── generateKeyPair ──────────────────────────────────────────────────────────
+
+/**
+ * Generate an ML-DSA-65 key pair for a device or entity.
+ *
+ * The entity keeps the secretKey private and passes the publicKey
+ * to pqauth.ca.issue() to obtain a certificate.
+ *
+ * @example
+ * const { publicKey, secretKey } = await generateKeyPair()
+ * // store secretKey securely on the device
+ * const { certificate } = await pqauth.ca.issue({
+ *   subject:          'device-serial-00123',
+ *   publicKey,
+ *   expiresInSeconds: 365 * 24 * 60 * 60,
+ * })
+ */
+export async function generateKeyPair(): Promise<{ publicKey: string; secretKey: string }> {
+  const seed = new Uint8Array(32)
+  crypto.getRandomValues(seed)
+  const keys = ml_dsa65.keygen(seed)
+  seed.fill(0)
+  return {
+    publicKey: toBase64(keys.publicKey),
+    secretKey: toBase64(keys.secretKey),
+  }
+}
+
 // ─── PQAuth client ────────────────────────────────────────────────────────────
 
 interface CachedKey {
@@ -201,7 +358,7 @@ export class PQAuth {
   private readonly timeout:     number
   private readonly localVerify: boolean
   private cachedKey:            CachedKey | null = null
-  private readonly keyTTL =     3600 // refresh public key every hour
+  private readonly keyTTL =     3600
 
   constructor(options: PQAuthOptions | string) {
     if (typeof options === 'string') {
@@ -224,7 +381,7 @@ export class PQAuth {
     }
   }
 
-  // ── Private: fetch wrapper with timeout and error normalization ─────────────
+  // ── Private: fetch wrapper ──────────────────────────────────────────────────
 
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const controller = new AbortController()
@@ -329,9 +486,6 @@ export class PQAuth {
    * Local verification does not check the revocation list — use remote verification
    * for sensitive operations such as payments or admin actions.
    *
-   * When server keys are rotated, the SDK automatically detects the mismatch,
-   * refreshes the cached public key, and retries — no action needed on your end.
-   *
    * @example
    * const { valid, payload } = await pqauth.verify(token)
    * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
@@ -382,11 +536,8 @@ export class PQAuth {
    * Future verify() calls will reject it even if the signature is valid
    * and the token has not yet expired.
    *
-   * Revocation always requires an API call, even when localVerify is enabled.
-   *
    * @example
    * await pqauth.revoke(token, 'user logged out')
-   * await pqauth.revoke(token, 'suspicious activity detected')
    */
   async revoke(token: PQToken, reason?: string): Promise<RevokeResult> {
     return this.request<RevokeResult>('/revoke', {
@@ -399,10 +550,6 @@ export class PQAuth {
 
   /**
    * Get current token balance and 6-month usage history.
-   *
-   * Free tokens reset on the 1st of each month (UTC) and do not accumulate.
-   * Pack tokens never expire and accumulate across purchases.
-   * All projects under the same account share a single pool.
    */
   async usage(): Promise<UsageResult> {
     return this.request<UsageResult>('/usage')
@@ -413,14 +560,11 @@ export class PQAuth {
   /**
    * Manage webhook configuration for real-time event notifications.
    *
-   * Events: token.signed · token.rejected · token.revoked · limit.warning · limit.reached
-   *
    * @example
    * const { webhook } = await pqauth.webhooks.register({
    *   url:    'https://yourapp.com/webhooks/pqauth',
    *   events: ['limit.warning', 'limit.reached', 'token.revoked'],
    * })
-   * console.log(webhook.secret) // store this — it won't be shown again
    */
   readonly webhooks = {
     register: (options: { url: string; events?: WebhookEvent[] }): Promise<WebhookResult> =>
@@ -436,20 +580,98 @@ export class PQAuth {
       this.request('/webhooks/test', { method: 'POST' }),
   }
 
+  // ── ca ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * Certificate Authority — issue and verify post-quantum certificates.
+   *
+   * The CA root is created once per project from the dashboard.
+   * Use ca.issue() to certify devices, services, or any entity at scale.
+   * Use ca.verifyCert() to verify certificates entirely offline — no API call needed.
+   *
+   * @example — issue a certificate for a device
+   * const { certificate } = await pqauth.ca.issue({
+   *   subject:          'device-serial-00123',
+   *   publicKey:        devicePublicKeyB64,
+   *   expiresInSeconds: 365 * 24 * 60 * 60,
+   *   meta:             { model: 'lock-v2', batch: '2026-05' },
+   * })
+   *
+   * @example — verify a certificate offline
+   * const result = pqauth.ca.verifyCert(deviceCert, rootCert)
+   * if (!result.valid) return reject(result.error)
+   *
+   * @example — check revocation
+   * const { crl } = await pqauth.ca.getCrl()
+   * const revoked = pqauth.ca.isCertRevoked(deviceCert, crl)
+   */
+  readonly ca = {
+
+    /**
+     * Issue a certificate signed by this project's CA.
+     * Costs 1 token per call.
+     */
+    issue: (options: CaIssueCertOptions): Promise<CaIssueCertResult> =>
+      this.request<CaIssueCertResult>('/ca/issue', {
+        method: 'POST',
+        body:   JSON.stringify(options),
+      }),
+
+    /**
+     * Revoke a certificate immediately.
+     * Costs 1 token per call.
+     */
+    revokeCert: (certId: string, reason?: string): Promise<CaRevokeCertResult> =>
+      this.request<CaRevokeCertResult>('/ca/revoke', {
+        method: 'POST',
+        body:   JSON.stringify({ certId, reason }),
+      }),
+
+    /**
+     * Get a certificate by ID.
+     * Free — no token cost.
+     */
+    getCert: (certId: string): Promise<CaGetCertResult> =>
+      this.request<CaGetCertResult>(`/ca/certificate/${certId}`),
+
+    /**
+     * Get the Certificate Revocation List for this project's CA.
+     * Free — no token cost.
+     */
+    getCrl: (): Promise<CaGetCrlResult> =>
+      this.request<CaGetCrlResult>('/ca/crl'),
+
+    /**
+     * Verify a certificate entirely offline using the CA root certificate.
+     * No API call — uses ML-DSA-65 locally.
+     * Does NOT check revocation — call getCrl() and isCertRevoked() for that.
+     */
+    verifyCert: (cert: PQCert, rootCert: PQCert): VerifyCertResult => {
+      try {
+        verifyCertLocally(cert, rootCert)
+        return { valid: true, cert }
+      } catch (err) {
+        const message = err instanceof PQAuthError ? err.message : 'Unknown error'
+        return { valid: false, error: message }
+      }
+    },
+
+    /**
+     * Check if a certificate appears in a CRL.
+     * Offline — pass the result of getCrl().
+     */
+    isCertRevoked: (cert: PQCert, crl: CrlEntry[]): boolean => {
+      return crl.some(entry => entry.certId === cert.id)
+    },
+  }
+
   // ── middleware() ─────────────────────────────────────────────────────────────
 
   /**
    * Express / Fastify middleware. Node.js only.
    *
-   * Reads Authorization: Bearer <base64(token)> and attaches the decoded
-   * payload to req.user. Returns 401 if the token is missing or invalid.
-   *
    * @example
    * app.use('/api', pqauth.middleware())
-   *
-   * app.get('/api/profile', (req, res) => {
-   *   res.json({ user: req.user })
-   * })
    */
   middleware() {
     return async (
@@ -490,11 +712,9 @@ export class PQAuth {
   /**
    * Preload and cache the server's public key at startup.
    *
-   * Recommended when using localVerify: true to avoid first-request latency.
-   *
    * @example
    * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true })
-   * await pqauth.preloadPublicKey() // call once at startup
+   * await pqauth.preloadPublicKey()
    */
   async preloadPublicKey(): Promise<void> {
     await this.getPublicKey()

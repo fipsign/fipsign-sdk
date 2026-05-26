@@ -314,6 +314,165 @@ app.post('/webhooks/fipsign', express.json(), (req, res) => {
 
 ---
 
+## ca — Certificate Authority
+
+Issue and verify post-quantum certificates for devices, services, or any entity that needs a tamper-proof identity. Built on ML-DSA-65 — the same algorithm used for token signing.
+
+**Typical use case:** A manufacturer of smart locks, IoT sensors, or logistics devices creates a CA root once per project from the dashboard. For each device manufactured, the system calls `ca.issue()` with the device's public key. The device stores its certificate. Verification happens entirely offline — no API call needed at runtime.
+
+**Setup:** Create a project in the dashboard, then click "Create CA" inside that project. Download the root certificate — you will need it for offline verification.
+
+**One CA per project.** Each project in the dashboard can have one root CA. The CA is created once from the dashboard — go to your project, expand it, and click "Create CA". Download and save the root certificate shown after creation — it is the trust anchor for all certificates issued by that CA and is never shown again.
+
+When you call `ca.issue()`, `ca.getCrl()`, or other CA methods, the SDK automatically uses the CA associated with the project that owns the API key. No `caId` parameter needed.
+
+---
+
+### generateKeyPair() — Generate a key pair for a device
+
+Generate an ML-DSA-65 key pair. The device keeps the `secretKey` and passes the `publicKey` to `ca.issue()`.
+
+```typescript
+import { generateKeyPair } from 'fipsign-sdk'
+
+const { publicKey, secretKey } = await generateKeyPair()
+// store secretKey securely on the device — never send it to the server
+// pass publicKey to ca.issue() to obtain a certificate
+```
+
+---
+
+### ca.issue() — Issue a certificate
+
+Issue a certificate signed by your project's CA. Cost: 1 token.
+
+```typescript
+const { certificate, meta } = await fipsign.ca.issue({
+  subject:          'device-serial-00123',   // any identifier
+  publicKey:        devicePublicKey,          // base64 ML-DSA-65 public key
+  expiresInSeconds: 365 * 24 * 60 * 60,      // required — max 5 years
+  meta:             { model: 'lock-v2', batch: '2026-05' }, // optional
+})
+
+console.log(certificate.id)        // cert_...
+console.log(certificate.caId)      // ca_... — the CA that signed it
+console.log(certificate.expiresAt) // Unix timestamp
+console.log(meta.certId)           // same as certificate.id
+```
+
+---
+
+### ca.verifyCert() — Verify a certificate offline
+
+Verify a certificate entirely in memory using the CA root certificate. No API call — uses ML-DSA-65 locally. Does not check revocation.
+
+```typescript
+import rootCert from './root-cert.json' assert { type: 'json' }
+
+const result = fipsign.ca.verifyCert(deviceCert, rootCert)
+
+if (!result.valid) {
+  console.error(result.error) // 'Invalid certificate signature', 'CERT_EXPIRED', etc.
+  return reject('Device not authorized')
+}
+
+console.log(result.cert.subject)   // 'device-serial-00123'
+console.log(result.cert.expiresAt) // Unix timestamp
+```
+
+---
+
+### ca.isCertRevoked() — Check revocation offline
+
+Check if a certificate appears in a CRL. Offline — pass the result of `ca.getCrl()`.
+
+```typescript
+const { crl } = await fipsign.ca.getCrl()
+
+if (fipsign.ca.isCertRevoked(deviceCert, crl)) {
+  return reject('Device certificate has been revoked')
+}
+```
+
+---
+
+### ca.getCrl() — Get the Certificate Revocation List
+
+Fetch the current CRL for your project's CA. Free — no token cost.
+
+```typescript
+const { caId, subject, crl, generatedAt } = await fipsign.ca.getCrl()
+
+console.log(`CA: ${subject}`)
+console.log(`${crl.length} revoked certificates`)
+
+crl.forEach(({ certId, revokedAt, reason }) => {
+  console.log(`${certId} — revoked ${new Date(revokedAt * 1000).toISOString()} — ${reason}`)
+})
+```
+
+---
+
+### ca.getCert() — Get a certificate by ID
+
+Retrieve a certificate and its current status. Free — no token cost.
+
+```typescript
+const { certificate, status } = await fipsign.ca.getCert('cert_...')
+
+console.log(status.revoked)   // boolean
+console.log(status.expired)   // boolean
+console.log(status.revokedAt) // Unix timestamp or null
+console.log(status.expiresAt) // Unix timestamp
+```
+
+---
+
+### ca.revokeCert() — Revoke a certificate
+
+Revoke a certificate immediately. It will appear in the CRL from this point on. Cost: 1 token.
+
+```typescript
+await fipsign.ca.revokeCert('cert_...', 'device decommissioned')
+await fipsign.ca.revokeCert('cert_...', 'device reported stolen')
+```
+
+---
+
+### Full device lifecycle example
+
+```typescript
+import { PQAuth, generateKeyPair } from 'fipsign-sdk'
+import rootCert from './root-cert.json' assert { type: 'json' }
+
+const fipsign = new PQAuth('pqa_your_api_key')
+
+// 1. Factory: generate a key pair for the device
+const { publicKey, secretKey } = await generateKeyPair()
+
+// 2. Factory: issue a certificate for the device
+const { certificate } = await fipsign.ca.issue({
+  subject:          'lock-serial-00123',
+  publicKey,
+  expiresInSeconds: 365 * 24 * 60 * 60,
+  meta:             { model: 'lock-v3', batch: '2026-05' },
+})
+// store certificate and secretKey on the device
+
+// 3. At runtime: verify the device certificate offline
+const result = fipsign.ca.verifyCert(certificate, rootCert)
+if (!result.valid) return reject(result.error)
+
+// 4. At runtime: check the device is not revoked
+const { crl } = await fipsign.ca.getCrl()
+if (fipsign.ca.isCertRevoked(certificate, crl)) return reject('Device revoked')
+
+// 5. Decommission: revoke the certificate
+await fipsign.ca.revokeCert(certificate.id, 'device decommissioned')
+```
+
+---
+
 ## Error handling
 
 `verify()` never throws — it always returns `{ valid, payload }` or `{ valid: false, error }`.
@@ -343,6 +502,14 @@ try {
         break
       case 'UNSUPPORTED_ALGORITHM': // local verify: unknown algorithm
         break
+      case 'INVALID_CERT_TYPE':       // ca.verifyCert(): expected CA_ROOT or CA_CERT
+        break
+      case 'CA_MISMATCH':             // ca.verifyCert(): cert was not issued by this CA
+        break
+      case 'CERT_EXPIRED':            // ca.verifyCert(): certificate has expired
+        break
+      case 'INVALID_CERT_SIGNATURE':  // ca.verifyCert(): signature invalid
+        break  
     }
     console.error(err.code, err.message, err.status)
   }
@@ -355,13 +522,15 @@ try {
 
 Every account gets **10,000 free tokens per month**, reset on the 1st (UTC). Unused free tokens do not carry over. Additional tokens are available as non-expiring packs, purchased from the dashboard.
 
-Each of these operations costs **1 token**: signing (`/sign`), verification (`/verify`), and revocation (`/revoke`). Checking usage (`/usage`) and fetching the public key (`/public-key`) are free.
+Each of these operations costs **1 token**: signing (`/sign`), verification (`/verify`), revocation (`/revoke`), certificate issuance (`/ca/issue`), and certificate revocation (`/ca/revoke`). Checking usage (`/usage`), fetching the public key (`/public-key`), and all CA read operations (`/ca/crl`, `/ca/certificate/:id`) are free.
 
 ---
 
 ## Rate limits
 
 300 requests per minute per API key on `/sign`, `/verify`, and `/revoke`. On excess the API returns HTTP 429.
+
+CA operations (`/ca/issue`, `/ca/revoke`, `/ca/create`) are rate limited at 300 requests per minute per API key, consistent with `/sign` and `/verify`. Read operations (`/ca/crl`, `/ca/certificate/:id`) are not rate limited.
 
 Token quota and rate limits are separate controls — check the error message to distinguish them:
 - `"Rate limit exceeded"` → back off and retry with exponential backoff

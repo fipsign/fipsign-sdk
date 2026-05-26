@@ -501,11 +501,12 @@ async function run() {
     pass('ML-DSA-65 signature verified independently — cryptography is correct')
   } catch (err) { fail('independent ML-DSA-65 verification', err) }
 
-  // ─── 14 Distinct signatures for identical payloads ───────────────────────────
+// ─── 14 Distinct signatures for identical payloads ───────────────────────────
   section('14 · Distinct signatures for identical payloads')
   try {
     const payload = { sub: 'replay_test', role: 'admin', expiresInSeconds: 3600 }
     const r1 = await pq.sign(payload)
+    await sleep(1100) // ensure iat differs — backend uses Unix seconds
     const r2 = await pq.sign(payload)
 
     if (r1.token.signature === r2.token.signature) {
@@ -563,6 +564,197 @@ async function run() {
 
     await pq.webhooks.delete()
   } catch (err) { fail('webhook delivery confirmation', err) }
+
+// ─── 16 Certificate Authority ─────────────────────────────────────────────
+  section('16 · Certificate Authority')
+
+  const ROOT_CERT_JSON = process.env.FIPSIGN_ROOT_CERT_JSON
+    ? JSON.parse(process.env.FIPSIGN_ROOT_CERT_JSON)
+    : null
+
+  if (!ROOT_CERT_JSON) {
+    console.log('  ' + DIM + 'ℹ FIPSIGN_ROOT_CERT_JSON not set — verifyCert() offline test will be skipped.' + RESET)
+    console.log('  ' + DIM + '  Download your root cert from the dashboard and pass it as:' + RESET)
+    console.log('  ' + DIM + "  FIPSIGN_ROOT_CERT_JSON='$(cat root-cert.json)' node test-sdk.mjs" + RESET)
+  }
+
+  // 16.1 generateKeyPair
+  let devicePublicKey, deviceSecretKey
+  try {
+    const { generateKeyPair } = await import('fipsign-sdk')
+    const kp = await generateKeyPair()
+    if (!kp.publicKey)  throw new Error('missing publicKey')
+    if (!kp.secretKey)  throw new Error('missing secretKey')
+    if (typeof kp.publicKey !== 'string') throw new Error('publicKey must be a string')
+    if (typeof kp.secretKey !== 'string') throw new Error('secretKey must be a string')
+    // Verify it's valid base64 by decoding
+    const decoded = atob(kp.publicKey)
+    if (decoded.length === 0) throw new Error('publicKey decoded to empty bytes')
+    log('publicKey length',  String(atob(kp.publicKey).length) + ' bytes')
+    log('secretKey length',  String(atob(kp.secretKey).length) + ' bytes')
+    devicePublicKey = kp.publicKey
+    deviceSecretKey = kp.secretKey
+    pass('generateKeyPair() — ML-DSA-65 key pair generated')
+  } catch (err) { fail('generateKeyPair()', err) }
+
+  // 16.2 ca.issue()
+  let issuedCert, issuedCertId
+  try {
+    if (!devicePublicKey) throw new Error('skipped — generateKeyPair() failed')
+    const r = await pq.ca.issue({
+      subject:          'device-test-' + Date.now(),
+      publicKey:        devicePublicKey,
+      expiresInSeconds: 86400,
+      meta:             { env: 'test', sdk: 'fipsign-sdk' },
+    })
+    if (!r.certificate)              throw new Error('missing certificate')
+    if (r.certificate.type !== 'CA_CERT') throw new Error('expected CA_CERT, got ' + r.certificate.type)
+    if (!r.certificate.id)           throw new Error('missing certificate.id')
+    if (!r.certificate.signature)    throw new Error('missing certificate.signature')
+    if (!r.certificate.caId)         throw new Error('missing certificate.caId')
+    if (!r.certificate.expiresAt)    throw new Error('missing certificate.expiresAt')
+    if (!r.meta.certId)              throw new Error('missing meta.certId')
+    if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage.freeRemaining')
+    log('certId',    r.meta.certId)
+    log('caId',      r.certificate.caId)
+    log('subject',   r.certificate.subject)
+    log('expiresAt', new Date(r.certificate.expiresAt * 1000).toISOString())
+    log('algorithm', r.certificate.algorithm)
+    issuedCert   = r.certificate
+    issuedCertId = r.meta.certId
+    pass('ca.issue() — certificate issued with correct shape')
+  } catch (err) { fail('ca.issue()', err) }
+
+  // 16.3 ca.verifyCert() offline — optional
+  if (ROOT_CERT_JSON) {
+    try {
+      if (!issuedCert) throw new Error('skipped — ca.issue() failed')
+      const result = pq.ca.verifyCert(issuedCert, ROOT_CERT_JSON)
+      if (!result.valid) throw new Error('verifyCert returned invalid: ' + result.error)
+      log('valid',   String(result.valid))
+      log('subject', result.cert?.subject)
+      pass('ca.verifyCert() offline — certificate signature valid against root cert')
+    } catch (err) { fail('ca.verifyCert() offline', err) }
+
+    // 16.3b tampered cert should fail
+    try {
+      if (!issuedCert) throw new Error('skipped — ca.issue() failed')
+      const tampered = { ...issuedCert, subject: 'tampered-subject' }
+      const result   = pq.ca.verifyCert(tampered, ROOT_CERT_JSON)
+      if (result.valid) throw new Error('should have been invalid — cert was tampered')
+      log('valid', String(result.valid))
+      log('error', result.error)
+      pass('ca.verifyCert() — tampered certificate correctly rejected')
+    } catch (err) { fail('ca.verifyCert() tampered cert', err) }
+
+    // 16.3c wrong CA should fail
+    try {
+      if (!issuedCert) throw new Error('skipped — ca.issue() failed')
+      const wrongRoot = { ...ROOT_CERT_JSON, id: 'ca_wrong_id_000' }
+      const result    = pq.ca.verifyCert(issuedCert, wrongRoot)
+      if (result.valid) throw new Error('should have been invalid — wrong CA')
+      log('valid', String(result.valid))
+      log('error', result.error)
+      pass('ca.verifyCert() — wrong CA root correctly rejected')
+    } catch (err) { fail('ca.verifyCert() wrong CA', err) }
+  } else {
+    console.log('  ' + DIM + '  → ca.verifyCert() offline tests skipped (no FIPSIGN_ROOT_CERT_JSON)' + RESET)
+  }
+
+  // 16.4 ca.getCrl() — before revocation
+  let crlBefore
+  try {
+    const r = await pq.ca.getCrl()
+    if (!r.caId)              throw new Error('missing caId')
+    if (!r.subject)           throw new Error('missing subject')
+    if (!Array.isArray(r.crl)) throw new Error('crl is not an array')
+    if (typeof r.generatedAt !== 'number') throw new Error('missing generatedAt')
+    log('caId',        r.caId)
+    log('subject',     r.subject)
+    log('crl entries', String(r.crl.length))
+    crlBefore = r.crl
+    pass('ca.getCrl() — CRL returned with correct shape')
+  } catch (err) { fail('ca.getCrl()', err) }
+
+  // 16.5 ca.isCertRevoked() — before revocation
+  try {
+    if (!issuedCert || !crlBefore) throw new Error('skipped — previous steps failed')
+    const revoked = pq.ca.isCertRevoked(issuedCert, crlBefore)
+    if (revoked) throw new Error('cert should NOT be revoked yet')
+    log('revoked', String(revoked))
+    pass('ca.isCertRevoked() — cert correctly not in CRL before revocation')
+  } catch (err) { fail('ca.isCertRevoked() before revocation', err) }
+
+  // 16.6 ca.getCert()
+  try {
+    if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
+    const r = await pq.ca.getCert(issuedCertId)
+    if (!r.certificate)          throw new Error('missing certificate')
+    if (!r.status)               throw new Error('missing status')
+    if (r.status.revoked)        throw new Error('cert should not be revoked yet')
+    if (r.status.expired)        throw new Error('cert should not be expired')
+    if (r.status.revokedAt !== null) throw new Error('revokedAt should be null')
+    log('certId',  r.certificate.id)
+    log('revoked', String(r.status.revoked))
+    log('expired', String(r.status.expired))
+    pass('ca.getCert() — certificate retrieved with correct status')
+  } catch (err) { fail('ca.getCert()', err) }
+
+  // 16.7 ca.revokeCert()
+  try {
+    if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
+    const r = await pq.ca.revokeCert(issuedCertId, 'sdk integration test')
+    if (!r.certId)               throw new Error('missing certId')
+    if (!r.revokedAt)            throw new Error('missing revokedAt')
+    if (r.reason !== 'sdk integration test') throw new Error('wrong reason: ' + r.reason)
+    if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage')
+    log('certId',    r.certId)
+    log('revokedAt', new Date(r.revokedAt * 1000).toISOString())
+    log('reason',    r.reason)
+    pass('ca.revokeCert() — certificate revoked successfully')
+  } catch (err) { fail('ca.revokeCert()', err) }
+
+  // 16.8 ca.revokeCert() — already revoked should return 409
+  try {
+    if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
+    await pq.ca.revokeCert(issuedCertId, 'duplicate revocation')
+    fail('ca.revokeCert() duplicate — should have thrown', new Error('did not throw'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.status === 409) {
+      pass('ca.revokeCert() duplicate — correctly returns 409')
+    } else {
+      fail('ca.revokeCert() duplicate', err)
+    }
+  }
+
+  // 16.9 ca.getCrl() — after revocation
+  let crlAfter
+  try {
+    const r = await pq.ca.getCrl()
+    crlAfter = r.crl
+    log('crl entries after revocation', String(r.crl.length))
+    pass('ca.getCrl() after revocation — CRL fetched')
+  } catch (err) { fail('ca.getCrl() after revocation', err) }
+
+  // 16.10 ca.isCertRevoked() — after revocation
+  try {
+    if (!issuedCert || !crlAfter) throw new Error('skipped — previous steps failed')
+    const revoked = pq.ca.isCertRevoked(issuedCert, crlAfter)
+    if (!revoked) throw new Error('cert SHOULD be revoked now')
+    log('revoked', String(revoked))
+    pass('ca.isCertRevoked() — cert correctly found in CRL after revocation')
+  } catch (err) { fail('ca.isCertRevoked() after revocation', err) }
+
+  // 16.11 ca.getCert() — status after revocation
+  try {
+    if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
+    const r = await pq.ca.getCert(issuedCertId)
+    if (!r.status.revoked)    throw new Error('cert should be revoked now')
+    if (!r.status.revokedAt)  throw new Error('revokedAt should be set')
+    log('revoked',   String(r.status.revoked))
+    log('revokedAt', new Date(r.status.revokedAt * 1000).toISOString())
+    pass('ca.getCert() after revocation — status.revoked is true')
+  } catch (err) { fail('ca.getCert() after revocation', err) }
 
   // ─── Summary ──────────────────────────────────────────────────────────────────
   const total = passed + failed
