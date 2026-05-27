@@ -320,9 +320,11 @@ Issue and verify post-quantum certificates for devices, services, or any entity 
 
 **Typical use case:** A manufacturer of smart locks, IoT sensors, or logistics devices creates a CA root once per project from the dashboard. For each device manufactured, the system calls `ca.issue()` with the device's public key. The device stores its certificate. Verification happens entirely offline — no API call needed at runtime.
 
-**Setup:** Create a project in the dashboard, then click "Create CA" inside that project. Download the root certificate — you will need it for offline verification.
+**Setup:** Create a project in the dashboard, then click "Create CA" inside that project. A root certificate will be shown immediately after creation.
 
-**One CA per project.** Each project in the dashboard can have one root CA. The CA is created once from the dashboard — go to your project, expand it, and click "Create CA". Download and save the root certificate shown after creation — it is the trust anchor for all certificates issued by that CA and is never shown again.
+> **Save the root certificate now.** It is shown only once and cannot be retrieved again. Without it, offline verification via `ca.verifyCert()` is not possible for any certificate issued by this CA. Store it in a secrets manager or secure file — treat it like a private key.
+
+**One CA per project.** Each project can have one root CA. The CA is created once from the dashboard — no API call needed for setup.
 
 When you call `ca.issue()`, `ca.getCrl()`, or other CA methods, the SDK automatically uses the CA associated with the project that owns the API key. No `caId` parameter needed.
 
@@ -346,12 +348,14 @@ const { publicKey, secretKey } = await generateKeyPair()
 
 Issue a certificate signed by your project's CA. Cost: 1 token.
 
+`expiresInSeconds` is required and must be between 60 seconds (minimum) and 157,680,000 seconds (5 years maximum).
+
 ```typescript
 const { certificate, meta } = await fipsign.ca.issue({
   subject:          'device-serial-00123',   // any identifier
   publicKey:        devicePublicKey,          // base64 ML-DSA-65 public key
-  expiresInSeconds: 365 * 24 * 60 * 60,      // required — max 5 years
-  meta:             { model: 'lock-v2', batch: '2026-05' }, // optional
+  expiresInSeconds: 365 * 24 * 60 * 60,      // required — between 60s and 5 years
+  meta:             { model: 'lock-v2', batch: '2026-05' }, // optional, max 10 keys
 })
 
 console.log(certificate.id)        // cert_...
@@ -400,6 +404,8 @@ if (fipsign.ca.isCertRevoked(deviceCert, crl)) {
 
 Fetch the current CRL for your project's CA. Free — no token cost.
 
+Use `getCrl()` when you need to verify revocation status offline or in bulk — download the list once and check multiple certificates against it locally using `isCertRevoked()`. For checking the status of a single certificate in real time (e.g. before a high-value transaction), use `getCert()` instead.
+
 ```typescript
 const { caId, subject, crl, generatedAt } = await fipsign.ca.getCrl()
 
@@ -407,7 +413,8 @@ console.log(`CA: ${subject}`)
 console.log(`${crl.length} revoked certificates`)
 
 crl.forEach(({ certId, revokedAt, reason }) => {
-  console.log(`${certId} — revoked ${new Date(revokedAt * 1000).toISOString()} — ${reason}`)
+  // reason may be null if no reason was provided at revocation time
+  console.log(`${certId} — revoked ${new Date(revokedAt * 1000).toISOString()} — ${reason ?? 'no reason'}`)
 })
 ```
 
@@ -415,7 +422,7 @@ crl.forEach(({ certId, revokedAt, reason }) => {
 
 ### ca.getCert() — Get a certificate by ID
 
-Retrieve a certificate and its current status. Free — no token cost.
+Retrieve a certificate and its current status directly from the server. Use this when you need the real-time revocation status of a specific certificate — for example, before authorizing a high-value operation. Free — no token cost.
 
 ```typescript
 const { certificate, status } = await fipsign.ca.getCert('cert_...')
@@ -509,7 +516,7 @@ try {
       case 'CERT_EXPIRED':            // ca.verifyCert(): certificate has expired
         break
       case 'INVALID_CERT_SIGNATURE':  // ca.verifyCert(): signature invalid
-        break  
+        break
     }
     console.error(err.code, err.message, err.status)
   }

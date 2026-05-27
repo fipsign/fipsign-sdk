@@ -8,11 +8,15 @@
  *   WEBHOOK_SITE_TOKEN=your-uuid         \
  *   node test-sdk.mjs
  *
+ * Optional:
+ *   FIPSIGN_ROOT_CERT_JSON='$(cat root-cert.json)'   — enables offline verifyCert() tests
+ *
  * Prerequisites:
  *   1. Create a free account at https://app.fipsign.dev
  *   2. Create a project and an API key inside that project
- *   3. Create a free endpoint at https://webhook.site and copy your UUID
- *   4. npm install fipsign-sdk
+ *   3. Create a CA for that project from the dashboard
+ *   4. Create a free endpoint at https://webhook.site and copy your UUID
+ *   5. npm install fipsign-sdk
  */
 
 import { PQAuth, PQAuthError } from 'fipsign-sdk'
@@ -81,7 +85,7 @@ function fromBase64(b64) {
 
 async function run() {
   console.log('\n' + BOLD + 'FIPSign SDK — Integration Test' + RESET)
-  console.log(DIM + 'fipsign-sdk@0.5.2 · ' + new Date().toISOString() + RESET + '\n')
+  console.log(DIM + 'fipsign-sdk · ' + new Date().toISOString() + RESET + '\n')
 
   const pq = new PQAuth(API_KEY)
 
@@ -501,7 +505,7 @@ async function run() {
     pass('ML-DSA-65 signature verified independently — cryptography is correct')
   } catch (err) { fail('independent ML-DSA-65 verification', err) }
 
-// ─── 14 Distinct signatures for identical payloads ───────────────────────────
+  // ─── 14 Distinct signatures for identical payloads ───────────────────────────
   section('14 · Distinct signatures for identical payloads')
   try {
     const payload = { sub: 'replay_test', role: 'admin', expiresInSeconds: 3600 }
@@ -565,7 +569,7 @@ async function run() {
     await pq.webhooks.delete()
   } catch (err) { fail('webhook delivery confirmation', err) }
 
-// ─── 16 Certificate Authority ─────────────────────────────────────────────
+  // ─── 16 Certificate Authority ─────────────────────────────────────────────
   section('16 · Certificate Authority')
 
   const ROOT_CERT_JSON = process.env.FIPSIGN_ROOT_CERT_JSON
@@ -573,7 +577,7 @@ async function run() {
     : null
 
   if (!ROOT_CERT_JSON) {
-    console.log('  ' + DIM + 'ℹ FIPSIGN_ROOT_CERT_JSON not set — verifyCert() offline test will be skipped.' + RESET)
+    console.log('  ' + DIM + 'ℹ FIPSIGN_ROOT_CERT_JSON not set — verifyCert() offline tests will be skipped.' + RESET)
     console.log('  ' + DIM + '  Download your root cert from the dashboard and pass it as:' + RESET)
     console.log('  ' + DIM + "  FIPSIGN_ROOT_CERT_JSON='$(cat root-cert.json)' node test-sdk.mjs" + RESET)
   }
@@ -587,7 +591,6 @@ async function run() {
     if (!kp.secretKey)  throw new Error('missing secretKey')
     if (typeof kp.publicKey !== 'string') throw new Error('publicKey must be a string')
     if (typeof kp.secretKey !== 'string') throw new Error('secretKey must be a string')
-    // Verify it's valid base64 by decoding
     const decoded = atob(kp.publicKey)
     if (decoded.length === 0) throw new Error('publicKey decoded to empty bytes')
     log('publicKey length',  String(atob(kp.publicKey).length) + ' bytes')
@@ -625,7 +628,43 @@ async function run() {
     pass('ca.issue() — certificate issued with correct shape')
   } catch (err) { fail('ca.issue()', err) }
 
-  // 16.3 ca.verifyCert() offline — optional
+  // 16.3 ca.issue() — expiresInSeconds below minimum (< 60)
+  try {
+    if (!devicePublicKey) throw new Error('skipped — generateKeyPair() failed')
+    await pq.ca.issue({
+      subject:          'device-expire-min-test',
+      publicKey:        devicePublicKey,
+      expiresInSeconds: 30,
+    })
+    fail('ca.issue() rejects expiresInSeconds < 60', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'API_ERROR' && err.status === 400) {
+      log('expiresInSeconds', '30 → rejected')
+      pass('ca.issue() — throws API_ERROR(400) when expiresInSeconds < 60')
+    } else {
+      fail('ca.issue() rejects expiresInSeconds < 60', err)
+    }
+  }
+
+  // 16.4 ca.issue() — expiresInSeconds above maximum (> 5 years)
+  try {
+    if (!devicePublicKey) throw new Error('skipped — generateKeyPair() failed')
+    await pq.ca.issue({
+      subject:          'device-expire-max-test',
+      publicKey:        devicePublicKey,
+      expiresInSeconds: 200_000_000,
+    })
+    fail('ca.issue() rejects expiresInSeconds > 5 years', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'API_ERROR' && err.status === 400) {
+      log('expiresInSeconds', '200_000_000 → rejected')
+      pass('ca.issue() — throws API_ERROR(400) when expiresInSeconds > 5 years')
+    } else {
+      fail('ca.issue() rejects expiresInSeconds > 5 years', err)
+    }
+  }
+
+  // 16.5 ca.verifyCert() offline — optional (requires FIPSIGN_ROOT_CERT_JSON)
   if (ROOT_CERT_JSON) {
     try {
       if (!issuedCert) throw new Error('skipped — ca.issue() failed')
@@ -636,7 +675,7 @@ async function run() {
       pass('ca.verifyCert() offline — certificate signature valid against root cert')
     } catch (err) { fail('ca.verifyCert() offline', err) }
 
-    // 16.3b tampered cert should fail
+    // 16.5b tampered cert should fail
     try {
       if (!issuedCert) throw new Error('skipped — ca.issue() failed')
       const tampered = { ...issuedCert, subject: 'tampered-subject' }
@@ -647,7 +686,7 @@ async function run() {
       pass('ca.verifyCert() — tampered certificate correctly rejected')
     } catch (err) { fail('ca.verifyCert() tampered cert', err) }
 
-    // 16.3c wrong CA should fail
+    // 16.5c wrong CA should fail
     try {
       if (!issuedCert) throw new Error('skipped — ca.issue() failed')
       const wrongRoot = { ...ROOT_CERT_JSON, id: 'ca_wrong_id_000' }
@@ -657,11 +696,34 @@ async function run() {
       log('error', result.error)
       pass('ca.verifyCert() — wrong CA root correctly rejected')
     } catch (err) { fail('ca.verifyCert() wrong CA', err) }
+
+    // 16.5d expired cert should fail verifyCert()
+    try {
+      if (!devicePublicKey) throw new Error('skipped — generateKeyPair() failed')
+      // Issue a cert with minimum TTL (60s), wait for it to expire, then verify
+      const r = await pq.ca.issue({
+        subject:          'device-expire-verify-test',
+        publicKey:        devicePublicKey,
+        expiresInSeconds: 60,
+      })
+      const expiredCert = r.certificate
+      log('issued cert expiresAt', new Date(expiredCert.expiresAt * 1000).toISOString())
+      console.log('  ' + DIM + 'Waiting 62 seconds for certificate to expire...' + RESET)
+      await sleep(62_000)
+      const result = pq.ca.verifyCert(expiredCert, ROOT_CERT_JSON)
+      if (result.valid) throw new Error('expired cert should fail verifyCert()')
+      if (!result.error) throw new Error('missing error message')
+      log('valid', String(result.valid))
+      log('error', result.error)
+      pass('ca.verifyCert() — expired certificate correctly rejected with CERT_EXPIRED')
+      // Clean up
+      await pq.ca.revokeCert(expiredCert.id, 'expired test cert cleanup').catch(() => {})
+    } catch (err) { fail('ca.verifyCert() expired cert', err) }
   } else {
     console.log('  ' + DIM + '  → ca.verifyCert() offline tests skipped (no FIPSIGN_ROOT_CERT_JSON)' + RESET)
   }
 
-  // 16.4 ca.getCrl() — before revocation
+  // 16.6 ca.getCrl() — before revocation
   let crlBefore
   try {
     const r = await pq.ca.getCrl()
@@ -676,7 +738,7 @@ async function run() {
     pass('ca.getCrl() — CRL returned with correct shape')
   } catch (err) { fail('ca.getCrl()', err) }
 
-  // 16.5 ca.isCertRevoked() — before revocation
+  // 16.7 ca.isCertRevoked() — before revocation
   try {
     if (!issuedCert || !crlBefore) throw new Error('skipped — previous steps failed')
     const revoked = pq.ca.isCertRevoked(issuedCert, crlBefore)
@@ -685,7 +747,7 @@ async function run() {
     pass('ca.isCertRevoked() — cert correctly not in CRL before revocation')
   } catch (err) { fail('ca.isCertRevoked() before revocation', err) }
 
-  // 16.6 ca.getCert()
+  // 16.8 ca.getCert() — existing cert
   try {
     if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
     const r = await pq.ca.getCert(issuedCertId)
@@ -700,7 +762,20 @@ async function run() {
     pass('ca.getCert() — certificate retrieved with correct status')
   } catch (err) { fail('ca.getCert()', err) }
 
-  // 16.7 ca.revokeCert()
+  // 16.9 ca.getCert() — non-existent certId returns 404
+  try {
+    await pq.ca.getCert('cert_nonexistent_000000000000000000000000')
+    fail('ca.getCert() non-existent certId — should have thrown', new Error('did not throw'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'API_ERROR' && err.status === 404) {
+      log('certId', 'cert_nonexistent_... → 404')
+      pass('ca.getCert() — throws API_ERROR(404) for non-existent certId')
+    } else {
+      fail('ca.getCert() non-existent certId', err)
+    }
+  }
+
+  // 16.10 ca.revokeCert()
   try {
     if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
     const r = await pq.ca.revokeCert(issuedCertId, 'sdk integration test')
@@ -714,7 +789,7 @@ async function run() {
     pass('ca.revokeCert() — certificate revoked successfully')
   } catch (err) { fail('ca.revokeCert()', err) }
 
-  // 16.8 ca.revokeCert() — already revoked should return 409
+  // 16.11 ca.revokeCert() — already revoked should return 409
   try {
     if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
     await pq.ca.revokeCert(issuedCertId, 'duplicate revocation')
@@ -727,16 +802,23 @@ async function run() {
     }
   }
 
-  // 16.9 ca.getCrl() — after revocation
+  // 16.12 ca.getCrl() — after revocation
   let crlAfter
   try {
     const r = await pq.ca.getCrl()
     crlAfter = r.crl
+    // Verify reason field — may be null if no reason was given
+    const entry = r.crl.find(e => e.certId === issuedCertId)
+    if (entry) {
+      const reasonIsValid = entry.reason === null || typeof entry.reason === 'string'
+      if (!reasonIsValid) throw new Error('reason must be string or null, got: ' + typeof entry.reason)
+      log('reason type', entry.reason === null ? 'null' : '"' + entry.reason + '"')
+    }
     log('crl entries after revocation', String(r.crl.length))
-    pass('ca.getCrl() after revocation — CRL fetched')
+    pass('ca.getCrl() after revocation — CRL fetched, reason field is string or null')
   } catch (err) { fail('ca.getCrl() after revocation', err) }
 
-  // 16.10 ca.isCertRevoked() — after revocation
+  // 16.13 ca.isCertRevoked() — after revocation
   try {
     if (!issuedCert || !crlAfter) throw new Error('skipped — previous steps failed')
     const revoked = pq.ca.isCertRevoked(issuedCert, crlAfter)
@@ -745,7 +827,7 @@ async function run() {
     pass('ca.isCertRevoked() — cert correctly found in CRL after revocation')
   } catch (err) { fail('ca.isCertRevoked() after revocation', err) }
 
-  // 16.11 ca.getCert() — status after revocation
+  // 16.14 ca.getCert() — status after revocation
   try {
     if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
     const r = await pq.ca.getCert(issuedCertId)
