@@ -722,25 +722,39 @@ export class PQAuth {
         }
 
         // ── Extraer public key del root cert ────────────────────────────────
-        // subjectPublicKeyInfo.subjectPublicKey es un ArrayBuffer del BIT STRING.
-        // El BIT STRING incluye un byte 0x00 (unused bits indicator) antes de la key.
-        // ML-DSA-65 public key = 1952 bytes raw → hay que skipear el primer byte.
-        const spkiRaw    = new Uint8Array(root.tbsCertificate.subjectPublicKeyInfo.subjectPublicKey)
-        const publicKey  = spkiRaw.slice(1)  // skip unused-bits byte (0x00)
-
-        if (publicKey.length !== 1952) {
+        // subjectPublicKeyInfo.subjectPublicKey es un ArrayBuffer del BIT STRING content.
+        // Dependiendo de la versión de @peculiar/asn1-x509, puede incluir o no
+        // el byte 0x00 de unused-bits al inicio. ML-DSA-65 public key = 1952 bytes raw.
+        // Estrategia robusta: probar con y sin el primer byte.
+        const spkiRaw = new Uint8Array(root.tbsCertificate.subjectPublicKeyInfo.subjectPublicKey)
+        let publicKey: Uint8Array
+        if (spkiRaw.length === 1952) {
+          publicKey = spkiRaw                // ya son los bytes raw
+        } else if (spkiRaw.length === 1953 && spkiRaw[0] === 0x00) {
+          publicKey = spkiRaw.slice(1)       // skip unused-bits byte
+        } else {
           return {
             valid: false,
-            error: `Unexpected public key size: ${publicKey.length} bytes (expected 1952 for ML-DSA-65)`,
+            error: `Unexpected public key size: ${spkiRaw.length} bytes (expected 1952 or 1953 for ML-DSA-65)`,
           }
         }
 
         // ── Extraer TBS y firma del device cert ─────────────────────────────
         // El mensaje a verificar es la serialización DER del TBSCertificate.
-        const tbsDer    = new Uint8Array(AsnConvert.serialize(cert.tbsCertificate))
-        // signatureValue es el BIT STRING completo incluyendo el byte unused-bits.
-        const sigRaw    = new Uint8Array(cert.signatureValue)
-        const signature = sigRaw.slice(1)  // skip unused-bits byte (0x00)
+        const tbsDer = new Uint8Array(AsnConvert.serialize(cert.tbsCertificate))
+        // signatureValue: mismo tratamiento robusto para unused-bits byte
+        const sigRaw = new Uint8Array(cert.signatureValue)
+        let signature: Uint8Array
+        if (sigRaw.length === 3309) {
+          signature = sigRaw                 // ya son los bytes raw
+        } else if (sigRaw.length === 3310 && sigRaw[0] === 0x00) {
+          signature = sigRaw.slice(1)        // skip unused-bits byte
+        } else {
+          return {
+            valid: false,
+            error: `Unexpected signature size: ${sigRaw.length} bytes (expected 3309 or 3310 for ML-DSA-65)`,
+          }
+        }
 
         // ── Verificar firma ML-DSA-65 ───────────────────────────────────────
         // OID ML-DSA-65: 2.16.840.1.101.3.4.3.18 (RFC 9881 final)
