@@ -762,7 +762,16 @@ async function run() {
     // tampered PEM should fail
     try {
       if (!issuedCert || typeof issuedCert !== 'string') throw new Error('skipped — not X.509')
-      const tampered = issuedCert.replace(/[A-Za-z0-9+/]{10}/, 'AAAAAAAAAA')
+      // Adulterar bytes en el medio del base64 (lejos de los headers y footer)
+      // Extraer las líneas de contenido y modificar una en el medio
+      const lines = issuedCert.split('\n')
+      const contentLines = lines.filter(l => l && !l.startsWith('-----'))
+      const midIdx = Math.floor(contentLines.length / 2)
+      // Rotar un carácter para garantizar que el DER cambia
+      const origChar = contentLines[midIdx][4]
+      const newChar  = origChar === 'A' ? 'B' : 'A'
+      const tamperedLine = contentLines[midIdx].slice(0, 4) + newChar + contentLines[midIdx].slice(5)
+      const tampered = issuedCert.replace(contentLines[midIdx], tamperedLine)
       const result   = await pq.ca.verifyX509Cert(tampered, ROOT_CERT_PEM)
       if (result.valid) throw new Error('should have been invalid — cert was tampered')
       log('valid', String(result.valid))
