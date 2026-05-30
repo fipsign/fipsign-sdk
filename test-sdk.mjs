@@ -822,8 +822,8 @@ async function run() {
 
   // 16.7 ca.isCertRevoked() — before revocation
   try {
-    if (!issuedCert || !crlBefore) throw new Error('skipped — previous steps failed')
-    const revoked = pq.ca.isCertRevoked(issuedCert, crlBefore)
+    if (!issuedCertId || !crlBefore) throw new Error('skipped — previous steps failed')
+    const revoked = pq.ca.isCertRevoked(issuedCertId, crlBefore)
     if (revoked) throw new Error('cert should NOT be revoked yet')
     log('revoked', String(revoked))
     pass('ca.isCertRevoked() — cert correctly not in CRL before revocation')
@@ -910,8 +910,11 @@ async function run() {
 
   // 16.13 ca.isCertRevoked() — after revocation
   try {
-    if (!issuedCert || !crlAfter) throw new Error('skipped — previous steps failed')
-    const revoked = pq.ca.isCertRevoked(issuedCert, crlAfter)
+    if (!issuedCertId || !crlAfter) throw new Error('skipped — previous steps failed')
+    // For X.509: issuedCert is a PEM string — pass issuedCertId directly.
+    // For PQCert: issuedCert is a PQCert object — isCertRevoked reads .id from it.
+    // Using issuedCertId works for both formats.
+    const revoked = pq.ca.isCertRevoked(issuedCertId, crlAfter)
     if (!revoked) throw new Error('cert SHOULD be revoked now')
     log('revoked', String(revoked))
     pass('ca.isCertRevoked() — cert correctly found in CRL after revocation')
