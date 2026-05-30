@@ -45,6 +45,8 @@
     "typescript": "^5.5.3"
   },
   "dependencies": {
-    "@noble/post-quantum": "^0.6.1"
+    "@noble/post-quantum": "^0.6.1",
+    "@peculiar/asn1-schema": "^2.7.0",
+    "@peculiar/asn1-x509": "^2.7.0"
   }
 }

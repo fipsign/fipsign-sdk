@@ -152,7 +152,7 @@ export interface CaIssueCertOptions {
 }
 
 export interface CaIssueCertResult {
-  certificate: PQCert
+  certificate: PQCert | string  // PQCert para formato pqcert, string PEM para formato x509
   meta: {
     certId:    string
     caId:      string
@@ -188,7 +188,7 @@ export interface CaCertStatus {
 }
 
 export interface CaGetCertResult {
-  certificate: PQCert
+  certificate: PQCert | string  // PQCert para formato pqcert, string PEM para formato x509
   status:      CaCertStatus
 }
 
@@ -207,7 +207,7 @@ export interface CaGetCrlResult {
 
 export interface VerifyCertResult {
   valid:  boolean
-  cert?:  PQCert
+  cert?:  PQCert | string  // PQCert para pqcert, string PEM para x509
   error?: string
 }
 
@@ -659,9 +659,103 @@ export class PQAuth {
     /**
      * Check if a certificate appears in a CRL.
      * Offline — pass the result of getCrl().
+     *
+     * Accepts either a PQCert object (pqcert format) or a certId string (x509 format).
+     * The certId string is returned in the `meta.certId` field of ca.issue().
+     *
+     * @example — PQCert format
+     * const revoked = pqauth.ca.isCertRevoked(cert, crl)
+     *
+     * @example — X.509 format
+     * const revoked = pqauth.ca.isCertRevoked(meta.certId, crl)
      */
-    isCertRevoked: (cert: PQCert, crl: CrlEntry[]): boolean => {
-      return crl.some(entry => entry.certId === cert.id)
+    isCertRevoked: (certOrId: PQCert | string, crl: CrlEntry[]): boolean => {
+      const id = typeof certOrId === 'string' ? certOrId : certOrId.id
+      return crl.some(entry => entry.certId === id)
+    },
+
+    /**
+     * Verify an X.509 ML-DSA-65 certificate entirely offline.
+     * No API call — parses the PEM locally and verifies the ML-DSA-65 signature.
+     *
+     * Only for X.509 format CAs. For PQCert format use ca.verifyCert() instead.
+     * Does NOT check revocation — call getCrl() and isCertRevoked() for that.
+     *
+     * Never throws — returns { valid: false, error } on any failure.
+     *
+     * @example
+     * const result = await pqauth.ca.verifyX509Cert(deviceCertPem, rootCertPem)
+     * if (!result.valid) return reject(result.error)
+     */
+    verifyX509Cert: async (certPem: string, rootPem: string): Promise<VerifyCertResult> => {
+      try {
+        const { AsnConvert }  = await import('@peculiar/asn1-schema')
+        const { Certificate } = await import('@peculiar/asn1-x509')
+
+        // ── Parsear ambos certs desde PEM ───────────────────────────────────
+        const pemToDer = (pem: string): Uint8Array => {
+          const b64    = pem.replace(/-----[^-]+-----/g, '').replace(/\s/g, '')
+          const binary = atob(b64)
+          const bytes  = new Uint8Array(binary.length)
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+          return bytes
+        }
+
+        const certDer = pemToDer(certPem)
+        const rootDer = pemToDer(rootPem)
+
+        const cert = AsnConvert.parse(
+          certDer.buffer.slice(certDer.byteOffset, certDer.byteOffset + certDer.byteLength),
+          Certificate
+        )
+        const root = AsnConvert.parse(
+          rootDer.buffer.slice(rootDer.byteOffset, rootDer.byteOffset + rootDer.byteLength),
+          Certificate
+        )
+
+        // ── Verificar expiración ────────────────────────────────────────────
+        const now      = new Date()
+        const notAfter = cert.tbsCertificate.validity.notAfter.utcTime
+          ?? cert.tbsCertificate.validity.notAfter.generalTime
+        if (notAfter && notAfter < now) {
+          return { valid: false, error: 'Certificate has expired' }
+        }
+
+        // ── Extraer public key del root cert ────────────────────────────────
+        // subjectPublicKeyInfo.subjectPublicKey es un ArrayBuffer del BIT STRING.
+        // El BIT STRING incluye un byte 0x00 (unused bits indicator) antes de la key.
+        // ML-DSA-65 public key = 1952 bytes raw → hay que skipear el primer byte.
+        const spkiRaw    = new Uint8Array(root.tbsCertificate.subjectPublicKeyInfo.subjectPublicKey)
+        const publicKey  = spkiRaw.slice(1)  // skip unused-bits byte (0x00)
+
+        if (publicKey.length !== 1952) {
+          return {
+            valid: false,
+            error: `Unexpected public key size: ${publicKey.length} bytes (expected 1952 for ML-DSA-65)`,
+          }
+        }
+
+        // ── Extraer TBS y firma del device cert ─────────────────────────────
+        // El mensaje a verificar es la serialización DER del TBSCertificate.
+        const tbsDer    = new Uint8Array(AsnConvert.serialize(cert.tbsCertificate))
+        // signatureValue es el BIT STRING completo incluyendo el byte unused-bits.
+        const sigRaw    = new Uint8Array(cert.signatureValue)
+        const signature = sigRaw.slice(1)  // skip unused-bits byte (0x00)
+
+        // ── Verificar firma ML-DSA-65 ───────────────────────────────────────
+        // OID ML-DSA-65: 2.16.840.1.101.3.4.3.18 (RFC 9881 final)
+        const valid = ml_dsa65.verify(signature, tbsDer, publicKey)
+
+        return valid
+          ? { valid: true, cert: certPem }
+          : { valid: false, error: 'Invalid certificate signature — not signed by this root CA' }
+
+      } catch (err) {
+        return {
+          valid: false,
+          error: err instanceof Error ? err.message : 'Unknown error during X.509 verification',
+        }
+      }
     },
   }
 

@@ -320,9 +320,14 @@ Issue and verify post-quantum certificates for devices, services, or any entity 
 
 **Typical use case:** A manufacturer of smart locks, IoT sensors, or logistics devices creates a CA root once per project from the dashboard. For each device manufactured, the system calls `ca.issue()` with the device's public key. The device stores its certificate. Verification happens entirely offline — no API call needed at runtime.
 
-**Setup:** Create a project in the dashboard, then click "Create CA" inside that project. A root certificate will be shown immediately after creation.
+**Setup:** Create a project in the dashboard, then click "Create CA" inside that project. Choose a certificate format:
 
-> **Save the root certificate now.** It is shown only once and cannot be retrieved again. Without it, offline verification via `ca.verifyCert()` is not possible for any certificate issued by this CA. Store it in a secrets manager or secure file — treat it like a private key.
+- **PQCert** — FIPSign's native JSON format. Certificates are JSON objects verified with `ca.verifyCert()`. Simpler to work with in JavaScript/TypeScript environments.
+- **X.509** — Standard X.509 v3 PEM certificates signed with ML-DSA-65 (OID `2.16.840.1.101.3.4.3.18`, RFC 9881). Compatible with OpenSSL 3.5+, standard PKI tooling, and enterprise infrastructure. Verified with `ca.verifyX509Cert()`.
+
+The format is chosen once at CA creation and applies to all certificates issued by that CA. One CA per project — you cannot mix formats within a project.
+
+> **Save the root certificate now.** It is shown only once and cannot be retrieved again. Without it, offline verification is not possible for any certificate issued by this CA. Store it in a secrets manager or secure file — treat it like a private key.
 
 **One CA per project.** Each project can have one root CA. The CA is created once from the dashboard — no API call needed for setup.
 
@@ -332,7 +337,7 @@ When you call `ca.issue()`, `ca.getCrl()`, or other CA methods, the SDK automati
 
 ### generateKeyPair() — Generate a key pair for a device
 
-Generate an ML-DSA-65 key pair. The device keeps the `secretKey` and passes the `publicKey` to `ca.issue()`.
+Generate an ML-DSA-65 key pair. The device keeps the `secretKey` and passes the `publicKey` to `ca.issue()`. Works for both PQCert and X.509 CAs.
 
 ```typescript
 import { generateKeyPair } from 'fipsign-sdk'
@@ -350,25 +355,53 @@ Issue a certificate signed by your project's CA. Cost: 1 token.
 
 `expiresInSeconds` is required and must be between 60 seconds (minimum) and 157,680,000 seconds (5 years maximum).
 
+The shape of `certificate` in the response depends on the CA format of your project:
+
+- **PQCert CA** — `certificate` is a `PQCert` JSON object with fields like `.id`, `.caId`, `.signature`, `.expiresAt`.
+- **X.509 CA** — `certificate` is a PEM string (`"-----BEGIN CERTIFICATE-----\n..."`). Certificate metadata is available in `meta`.
+
 ```typescript
+// PQCert CA
 const { certificate, meta } = await fipsign.ca.issue({
-  subject:          'device-serial-00123',   // any identifier
-  publicKey:        devicePublicKey,          // base64 ML-DSA-65 public key
-  expiresInSeconds: 365 * 24 * 60 * 60,      // required — between 60s and 5 years
-  meta:             { model: 'lock-v2', batch: '2026-05' }, // optional, max 10 keys
+  subject:          'device-serial-00123',
+  publicKey:        devicePublicKey,
+  expiresInSeconds: 365 * 24 * 60 * 60,
+  meta:             { model: 'lock-v2', batch: '2026-05' },
 })
 
+// certificate is a PQCert object
 console.log(certificate.id)        // cert_...
 console.log(certificate.caId)      // ca_... — the CA that signed it
 console.log(certificate.expiresAt) // Unix timestamp
 console.log(meta.certId)           // same as certificate.id
+
+
+// X.509 CA
+const { certificate, meta } = await fipsign.ca.issue({
+  subject:          'device-serial-00123',
+  publicKey:        devicePublicKey,
+  expiresInSeconds: 365 * 24 * 60 * 60,
+})
+
+// certificate is a PEM string
+console.log(typeof certificate)    // "string"
+console.log(certificate)           // "-----BEGIN CERTIFICATE-----\n..."
+console.log(meta.certId)           // cert_... — use this for revocation
+console.log(meta.caId)             // ca_...
+console.log(meta.expiresAt)        // Unix timestamp
 ```
+
+> **Note for X.509:** The `meta.certId` returned by `ca.issue()` is what you need for `ca.revokeCert()` and `ca.isCertRevoked()`. Store it alongside the PEM certificate.
+
+> **Note:** The `meta` field and the `expiresInSeconds` option are not available for X.509 CAs. For X.509, all metadata is encoded inside the PEM certificate itself.
 
 ---
 
-### ca.verifyCert() — Verify a certificate offline
+### ca.verifyCert() — Verify a PQCert certificate offline
 
-Verify a certificate entirely in memory using the CA root certificate. No API call — uses ML-DSA-65 locally. Does not check revocation.
+Verify a **PQCert** certificate entirely in memory using the CA root certificate. No API call — uses ML-DSA-65 locally. Does not check revocation.
+
+For X.509 certificates use `ca.verifyX509Cert()` instead.
 
 ```typescript
 import rootCert from './root-cert.json' assert { type: 'json' }
@@ -386,14 +419,45 @@ console.log(result.cert.expiresAt) // Unix timestamp
 
 ---
 
+### ca.verifyX509Cert() — Verify an X.509 certificate offline
+
+Verify an **X.509** PEM certificate entirely in memory using the root CA PEM. No API call — parses the DER locally and verifies the ML-DSA-65 signature. Does not check revocation.
+
+Never throws — always returns `{ valid, cert? }` or `{ valid: false, error }`.
+
+For PQCert certificates use `ca.verifyCert()` instead.
+
+```typescript
+// rootCertPem is the PEM string shown at CA creation — save it once
+const result = await fipsign.ca.verifyX509Cert(deviceCertPem, rootCertPem)
+
+if (!result.valid) {
+  console.error(result.error) // 'Certificate has expired', 'Invalid certificate signature', etc.
+  return reject('Device not authorized')
+}
+
+// result.cert is the PEM string of the verified certificate
+console.log(result.cert) // "-----BEGIN CERTIFICATE-----\n..."
+```
+
+---
+
 ### ca.isCertRevoked() — Check revocation offline
 
 Check if a certificate appears in a CRL. Offline — pass the result of `ca.getCrl()`.
 
+Accepts either a **PQCert object** (for PQCert CAs) or a **certId string** (for X.509 CAs). The `certId` is returned in `meta.certId` from `ca.issue()`.
+
 ```typescript
 const { crl } = await fipsign.ca.getCrl()
 
+// PQCert CA — pass the certificate object
 if (fipsign.ca.isCertRevoked(deviceCert, crl)) {
+  return reject('Device certificate has been revoked')
+}
+
+// X.509 CA — pass the certId string from meta
+if (fipsign.ca.isCertRevoked(meta.certId, crl)) {
   return reject('Device certificate has been revoked')
 }
 ```
@@ -431,6 +495,9 @@ console.log(status.revoked)   // boolean
 console.log(status.expired)   // boolean
 console.log(status.revokedAt) // Unix timestamp or null
 console.log(status.expiresAt) // Unix timestamp
+
+// For PQCert CAs, certificate is a PQCert object
+// For X.509 CAs, certificate is a PEM string
 ```
 
 ---
@@ -446,7 +513,7 @@ await fipsign.ca.revokeCert('cert_...', 'device reported stolen')
 
 ---
 
-### Full device lifecycle example
+### Full device lifecycle — PQCert
 
 ```typescript
 import { PQAuth, generateKeyPair } from 'fipsign-sdk'
@@ -464,7 +531,7 @@ const { certificate } = await fipsign.ca.issue({
   expiresInSeconds: 365 * 24 * 60 * 60,
   meta:             { model: 'lock-v3', batch: '2026-05' },
 })
-// store certificate and secretKey on the device
+// store certificate (PQCert JSON object) and secretKey on the device
 
 // 3. At runtime: verify the device certificate offline
 const result = fipsign.ca.verifyCert(certificate, rootCert)
@@ -480,9 +547,44 @@ await fipsign.ca.revokeCert(certificate.id, 'device decommissioned')
 
 ---
 
+### Full device lifecycle — X.509
+
+```typescript
+import { PQAuth, generateKeyPair } from 'fipsign-sdk'
+
+const fipsign = new PQAuth('pqa_your_api_key')
+
+// rootCertPem — the PEM string shown once at CA creation, stored securely
+const rootCertPem = process.env.ROOT_CERT_PEM
+
+// 1. Factory: generate a key pair for the device
+const { publicKey, secretKey } = await generateKeyPair()
+
+// 2. Factory: issue a certificate for the device
+const { certificate: certPem, meta } = await fipsign.ca.issue({
+  subject:          'lock-serial-00123',
+  publicKey,
+  expiresInSeconds: 365 * 24 * 60 * 60,
+})
+// store certPem (PEM string), meta.certId, and secretKey on the device
+
+// 3. At runtime: verify the device certificate offline
+const result = await fipsign.ca.verifyX509Cert(certPem, rootCertPem)
+if (!result.valid) return reject(result.error)
+
+// 4. At runtime: check the device is not revoked
+const { crl } = await fipsign.ca.getCrl()
+if (fipsign.ca.isCertRevoked(meta.certId, crl)) return reject('Device revoked')
+
+// 5. Decommission: revoke the certificate using the certId from meta
+await fipsign.ca.revokeCert(meta.certId, 'device decommissioned')
+```
+
+---
+
 ## Error handling
 
-`verify()` never throws — it always returns `{ valid, payload }` or `{ valid: false, error }`.
+`verify()` and `ca.verifyX509Cert()` never throw — they always return `{ valid, ... }` or `{ valid: false, error }`.
 All other methods throw `PQAuthError` on failure.
 
 ```typescript
