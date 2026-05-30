@@ -576,10 +576,13 @@ async function run() {
     ? JSON.parse(process.env.FIPSIGN_ROOT_CERT_JSON)
     : null
 
-  if (!ROOT_CERT_JSON) {
-    console.log('  ' + DIM + 'ℹ FIPSIGN_ROOT_CERT_JSON not set — verifyCert() offline tests will be skipped.' + RESET)
-    console.log('  ' + DIM + '  Download your root cert from the dashboard and pass it as:' + RESET)
-    console.log('  ' + DIM + "  FIPSIGN_ROOT_CERT_JSON='$(cat root-cert.json)' node test-sdk.mjs" + RESET)
+  // X.509 root cert PEM — set this when testing against an X.509 CA
+  const ROOT_CERT_PEM = process.env.FIPSIGN_ROOT_CERT_PEM ?? null
+
+  if (!ROOT_CERT_JSON && !ROOT_CERT_PEM) {
+    console.log('  ' + DIM + 'ℹ FIPSIGN_ROOT_CERT_JSON / FIPSIGN_ROOT_CERT_PEM not set — offline verifyCert() tests will be skipped.' + RESET)
+    console.log('  ' + DIM + '  PQCert:  FIPSIGN_ROOT_CERT_JSON=\'$(cat root-cert.json)\' node test-sdk.mjs' + RESET)
+    console.log('  ' + DIM + '  X.509:   FIPSIGN_ROOT_CERT_PEM=\'$(cat root-cert.pem)\' node test-sdk.mjs' + RESET)
   }
 
   // 16.1 generateKeyPair
@@ -601,6 +604,9 @@ async function run() {
   } catch (err) { fail('generateKeyPair()', err) }
 
   // 16.2 ca.issue()
+  // Detect CA format from the certificate field:
+  //   PQCert → r.certificate is an object with .type, .id, .signature, etc.
+  //   X.509  → r.certificate is a PEM string starting with "-----BEGIN CERTIFICATE-----"
   let issuedCert, issuedCertId
   try {
     if (!devicePublicKey) throw new Error('skipped — generateKeyPair() failed')
@@ -610,20 +616,38 @@ async function run() {
       expiresInSeconds: 86400,
       meta:             { env: 'test', sdk: 'fipsign-sdk' },
     })
-    if (!r.certificate)              throw new Error('missing certificate')
-    if (r.certificate.type !== 'CA_CERT') throw new Error('expected CA_CERT, got ' + r.certificate.type)
-    if (!r.certificate.id)           throw new Error('missing certificate.id')
-    if (!r.certificate.signature)    throw new Error('missing certificate.signature')
-    if (!r.certificate.caId)         throw new Error('missing certificate.caId')
-    if (!r.certificate.expiresAt)    throw new Error('missing certificate.expiresAt')
-    if (!r.meta.certId)              throw new Error('missing meta.certId')
+    if (!r.certificate)           throw new Error('missing certificate')
+    if (!r.meta.certId)           throw new Error('missing meta.certId')
     if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage.freeRemaining')
-    log('certId',    r.meta.certId)
-    log('caId',      r.certificate.caId)
-    log('subject',   r.certificate.subject)
-    log('expiresAt', new Date(r.certificate.expiresAt * 1000).toISOString())
-    log('algorithm', r.certificate.algorithm)
-    issuedCert   = r.certificate
+
+    const isX509 = typeof r.certificate === 'string'
+
+    if (isX509) {
+      // X.509 — certificate is a PEM string, metadata comes from meta
+      if (!r.certificate.includes('BEGIN CERTIFICATE')) throw new Error('X.509 certificate is not a valid PEM string')
+      if (!r.meta.caId)      throw new Error('missing meta.caId')
+      if (!r.meta.expiresAt) throw new Error('missing meta.expiresAt')
+      log('format',    'x509')
+      log('certId',    r.meta.certId)
+      log('caId',      r.meta.caId)
+      log('expiresAt', new Date(r.meta.expiresAt * 1000).toISOString())
+      log('pem length', String(r.certificate.length) + ' chars')
+    } else {
+      // PQCert — certificate is a JSON object
+      if (r.certificate.type !== 'CA_CERT') throw new Error('expected CA_CERT, got ' + r.certificate.type)
+      if (!r.certificate.id)        throw new Error('missing certificate.id')
+      if (!r.certificate.signature) throw new Error('missing certificate.signature')
+      if (!r.certificate.caId)      throw new Error('missing certificate.caId')
+      if (!r.certificate.expiresAt) throw new Error('missing certificate.expiresAt')
+      log('format',    'pqcert')
+      log('certId',    r.meta.certId)
+      log('caId',      r.certificate.caId)
+      log('subject',   r.certificate.subject)
+      log('expiresAt', new Date(r.certificate.expiresAt * 1000).toISOString())
+      log('algorithm', r.certificate.algorithm)
+    }
+
+    issuedCert   = r.certificate  // PQCert object or PEM string
     issuedCertId = r.meta.certId
     pass('ca.issue() — certificate issued with correct shape')
   } catch (err) { fail('ca.issue()', err) }
@@ -723,18 +747,76 @@ async function run() {
     console.log('  ' + DIM + '  → ca.verifyCert() offline tests skipped (no FIPSIGN_ROOT_CERT_JSON)' + RESET)
   }
 
+  // 16.5e ca.verifyX509Cert() offline — optional (requires FIPSIGN_ROOT_CERT_PEM)
+  if (ROOT_CERT_PEM) {
+    try {
+      if (!issuedCert) throw new Error('skipped — ca.issue() failed')
+      if (typeof issuedCert !== 'string') throw new Error('skipped — CA is not X.509 format')
+      const result = await pq.ca.verifyX509Cert(issuedCert, ROOT_CERT_PEM)
+      if (!result.valid) throw new Error('verifyX509Cert returned invalid: ' + result.error)
+      log('valid', String(result.valid))
+      log('cert',  result.cert?.slice(0, 27) + '...')
+      pass('ca.verifyX509Cert() offline — X.509 cert signature valid against root PEM')
+    } catch (err) { fail('ca.verifyX509Cert() offline', err) }
+
+    // tampered PEM should fail
+    try {
+      if (!issuedCert || typeof issuedCert !== 'string') throw new Error('skipped — not X.509')
+      const tampered = issuedCert.replace(/[A-Za-z0-9+/]{10}/, 'AAAAAAAAAA')
+      const result   = await pq.ca.verifyX509Cert(tampered, ROOT_CERT_PEM)
+      if (result.valid) throw new Error('should have been invalid — cert was tampered')
+      log('valid', String(result.valid))
+      log('error', result.error)
+      pass('ca.verifyX509Cert() — tampered X.509 certificate correctly rejected')
+    } catch (err) { fail('ca.verifyX509Cert() tampered cert', err) }
+
+    // wrong root PEM should fail
+    try {
+      if (!issuedCert || typeof issuedCert !== 'string') throw new Error('skipped — not X.509')
+      // Use the leaf cert as a fake root — signature won't match
+      const result = await pq.ca.verifyX509Cert(issuedCert, issuedCert)
+      if (result.valid) throw new Error('should have been invalid — wrong root')
+      log('valid', String(result.valid))
+      log('error', result.error)
+      pass('ca.verifyX509Cert() — wrong root CA correctly rejected')
+    } catch (err) { fail('ca.verifyX509Cert() wrong root', err) }
+  } else {
+    console.log('  ' + DIM + '  → ca.verifyX509Cert() offline tests skipped (no FIPSIGN_ROOT_CERT_PEM)' + RESET)
+  }
+
   // 16.6 ca.getCrl() — before revocation
+  // PQCert: { caId, subject, crl: CrlEntry[], generatedAt }
+  // X.509:  { crl: { caId, subject, revokedCerts: CrlEntry[], signature, ... }, generatedAt }
   let crlBefore
   try {
     const r = await pq.ca.getCrl()
-    if (!r.caId)              throw new Error('missing caId')
-    if (!r.subject)           throw new Error('missing subject')
-    if (!Array.isArray(r.crl)) throw new Error('crl is not an array')
     if (typeof r.generatedAt !== 'number') throw new Error('missing generatedAt')
-    log('caId',        r.caId)
-    log('subject',     r.subject)
-    log('crl entries', String(r.crl.length))
-    crlBefore = r.crl
+
+    const isX509Crl = r.crl && !Array.isArray(r.crl) && typeof r.crl === 'object'
+
+    let caId, subject, crlEntries
+    if (isX509Crl) {
+      // X.509 signed CRL — fields are inside r.crl
+      caId       = r.crl.caId
+      subject    = r.crl.subject
+      crlEntries = r.crl.revokedCerts
+      if (!r.crl.signature) throw new Error('X.509 CRL missing signature')
+    } else {
+      // PQCert CRL — fields are at the root
+      caId       = r.caId
+      subject    = r.subject
+      crlEntries = r.crl
+    }
+
+    if (!caId)                    throw new Error('missing caId')
+    if (!subject)                 throw new Error('missing subject')
+    if (!Array.isArray(crlEntries)) throw new Error('crl entries is not an array')
+
+    log('caId',        caId)
+    log('subject',     subject)
+    log('crl entries', String(crlEntries.length))
+    log('format',      isX509Crl ? 'x509 signed CRL' : 'pqcert')
+    crlBefore = crlEntries
     pass('ca.getCrl() — CRL returned with correct shape')
   } catch (err) { fail('ca.getCrl()', err) }
 
@@ -756,7 +838,12 @@ async function run() {
     if (r.status.revoked)        throw new Error('cert should not be revoked yet')
     if (r.status.expired)        throw new Error('cert should not be expired')
     if (r.status.revokedAt !== null) throw new Error('revokedAt should be null')
-    log('certId',  r.certificate.id)
+    // For PQCert: certificate is an object with .id
+    // For X.509:  certificate is a PEM string — log its length instead
+    const certLabel = typeof r.certificate === 'string'
+      ? r.certificate.slice(0, 27) + '...'
+      : r.certificate.id
+    log('certId',  certLabel)
     log('revoked', String(r.status.revoked))
     log('expired', String(r.status.expired))
     pass('ca.getCert() — certificate retrieved with correct status')
@@ -806,15 +893,18 @@ async function run() {
   let crlAfter
   try {
     const r = await pq.ca.getCrl()
-    crlAfter = r.crl
+    const isX509Crl = r.crl && !Array.isArray(r.crl) && typeof r.crl === 'object'
+    const crlEntries = isX509Crl ? r.crl.revokedCerts : r.crl
+
+    crlAfter = crlEntries
     // Verify reason field — may be null if no reason was given
-    const entry = r.crl.find(e => e.certId === issuedCertId)
+    const entry = crlEntries.find(e => e.certId === issuedCertId)
     if (entry) {
       const reasonIsValid = entry.reason === null || typeof entry.reason === 'string'
       if (!reasonIsValid) throw new Error('reason must be string or null, got: ' + typeof entry.reason)
       log('reason type', entry.reason === null ? 'null' : '"' + entry.reason + '"')
     }
-    log('crl entries after revocation', String(r.crl.length))
+    log('crl entries after revocation', String(crlEntries.length))
     pass('ca.getCrl() after revocation — CRL fetched, reason field is string or null')
   } catch (err) { fail('ca.getCrl() after revocation', err) }
 
