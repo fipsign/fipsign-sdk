@@ -116,8 +116,10 @@ export interface WebhookResult {
 
 export interface WebhookGetResult {
   webhook: {
-    url:    string
-    events: WebhookEvent[]
+    url:       string
+    events:    WebhookEvent[]
+    active?:   boolean  // present in get() response
+    createdAt?: number  // Unix timestamp — present in get() response
   } | null
 }
 
@@ -161,6 +163,8 @@ export interface CaIssueCertResult {
     expiresAt: number
     algorithm: string
     standard:  string
+    format?:   string  // 'pqcert' | 'x509' — present for x509 CAs
+    sizeNote?: string  // x509 only: size advisory
   }
   usage: {
     freeRemaining:  number
@@ -173,6 +177,7 @@ export interface CaRevokeCertResult {
   certId:    string
   revokedAt: number
   reason:    string | null
+  format?:   string  // 'x509' — present for x509 CAs only
   usage: {
     freeRemaining:  number
     packRemaining:  number
@@ -190,6 +195,13 @@ export interface CaCertStatus {
 export interface CaGetCertResult {
   certificate: PQCert | string  // PQCert para formato pqcert, string PEM para formato x509
   status:      CaCertStatus
+  meta?: {     // x509 only: additional certificate metadata
+    certId:    string
+    caId:      string
+    subject:   string
+    format:    string
+    algorithm: string
+  }
 }
 
 export interface CrlEntry {
@@ -203,6 +215,7 @@ export interface CaGetCrlResult {
   subject:     string
   crl:         CrlEntry[]
   generatedAt: number
+  raw?:        Record<string, unknown>  // x509 only: full signed CRL object with ML-DSA-65 signature
 }
 
 export interface VerifyCertResult {
@@ -638,8 +651,31 @@ export class PQAuth {
      * Get the Certificate Revocation List for this project's CA.
      * Free — no token cost.
      */
-    getCrl: (): Promise<CaGetCrlResult> =>
-      this.request<CaGetCrlResult>('/ca/crl'),
+getCrl: async (): Promise<CaGetCrlResult> => {
+  const data = await this.request<Record<string, unknown>>('/ca/crl')
+  const rawCrl = data.crl
+
+  // X.509 CA: backend returns crl as a signed object with revokedCerts array
+  // PQCert CA: backend returns crl as a flat CrlEntry array
+  if (rawCrl && !Array.isArray(rawCrl) && typeof rawCrl === 'object') {
+    const obj = rawCrl as Record<string, unknown>
+    return {
+      caId:        (obj.caId        ?? data.caId        ?? '') as string,
+      subject:     (obj.subject     ?? data.subject     ?? '') as string,
+      crl:         (obj.revokedCerts ?? []) as CrlEntry[],
+      generatedAt: (obj.generatedAt  ?? data.generatedAt ?? 0) as number,
+      raw:         obj,
+    }
+  }
+
+  // PQCert — already flat
+  return {
+    caId:        data.caId        as string,
+    subject:     data.subject     as string,
+    crl:         (data.crl        ?? []) as CrlEntry[],
+    generatedAt: data.generatedAt as number,
+  }
+},
 
     /**
      * Verify a certificate entirely offline using the CA root certificate.
@@ -833,16 +869,24 @@ export class PQAuth {
   /**
    * Check the health of the PQAuth service.
    */
-  async health(): Promise<HealthResult> {
-    const controller = new AbortController()
-    const timer      = setTimeout(() => controller.abort(), this.timeout)
-    try {
-      const res = await fetch(`${this.baseUrl}/health`, { signal: controller.signal })
-      return res.json()
-    } finally {
-      clearTimeout(timer)
+async health(): Promise<HealthResult> {
+  const controller = new AbortController()
+  const timer      = setTimeout(() => controller.abort(), this.timeout)
+  try {
+    const res = await fetch(`${this.baseUrl}/health`, { signal: controller.signal })
+    return res.json()
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new PQAuthError('Request timed out', 'TIMEOUT')
     }
+    throw new PQAuthError(
+      `Network error: ${err instanceof Error ? err.message : 'unknown'}`,
+      'NETWORK_ERROR'
+    )
+  } finally {
+    clearTimeout(timer)
   }
+}
 }
 
 export default PQAuth

@@ -353,7 +353,7 @@ const { publicKey, secretKey } = await generateKeyPair()
 
 Issue a certificate signed by your project's CA. Cost: 1 token.
 
-`expiresInSeconds` is required and must be between 60 seconds (minimum) and 157,680,000 seconds (5 years maximum).
+`expiresInSeconds` is required for both PQCert and X.509 CAs, and must be between 60 seconds (minimum) and 157,680,000 seconds (5 years maximum).
 
 The shape of `certificate` in the response depends on the CA format of your project:
 
@@ -393,7 +393,7 @@ console.log(meta.expiresAt)        // Unix timestamp
 
 > **Note for X.509:** The `meta.certId` returned by `ca.issue()` is what you need for `ca.revokeCert()` and `ca.isCertRevoked()`. Store it alongside the PEM certificate.
 
-> **Note:** The `meta` field and the `expiresInSeconds` option are not available for X.509 CAs. For X.509, all metadata is encoded inside the PEM certificate itself.
+> **Note for X.509:** The `meta` option (custom key-value pairs) is supported for PQCert CAs only. If passed when using an X.509 CA, it is silently ignored by the server — custom attributes should be encoded in the certificate `subject` or stored separately.
 
 ---
 
@@ -468,10 +468,12 @@ if (fipsign.ca.isCertRevoked(meta.certId, crl)) {
 
 Fetch the current CRL for your project's CA. Free — no token cost.
 
+The returned `crl` is always a flat `CrlEntry[]` array regardless of CA format — the SDK normalizes the response automatically. For X.509 CAs, the full signed CRL object (including the ML-DSA-65 signature) is also available in the `raw` field if you need to verify the CRL signature independently.
+
 Use `getCrl()` when you need to verify revocation status offline or in bulk — download the list once and check multiple certificates against it locally using `isCertRevoked()`. For checking the status of a single certificate in real time (e.g. before a high-value transaction), use `getCert()` instead.
 
 ```typescript
-const { caId, subject, crl, generatedAt } = await fipsign.ca.getCrl()
+const { caId, subject, crl, generatedAt, raw } = await fipsign.ca.getCrl()
 
 console.log(`CA: ${subject}`)
 console.log(`${crl.length} revoked certificates`)
@@ -480,6 +482,12 @@ crl.forEach(({ certId, revokedAt, reason }) => {
   // reason may be null if no reason was provided at revocation time
   console.log(`${certId} — revoked ${new Date(revokedAt * 1000).toISOString()} — ${reason ?? 'no reason'}`)
 })
+
+// X.509 CAs only: raw contains the full signed CRL object with ML-DSA-65 signature
+// raw is undefined for PQCert CAs
+if (raw) {
+  console.log(raw.signature) // base64 ML-DSA-65 signature over the CRL
+}
 ```
 
 ---
@@ -639,7 +647,7 @@ Each of these operations costs **1 token**: signing (`/sign`), verification (`/v
 
 300 requests per minute per API key on `/sign`, `/verify`, and `/revoke`. On excess the API returns HTTP 429.
 
-CA operations (`/ca/issue`, `/ca/revoke`, `/ca/create`) are rate limited at 300 requests per minute per API key, consistent with `/sign` and `/verify`. Read operations (`/ca/crl`, `/ca/certificate/:id`) are not rate limited.
+CA operations (`/ca/issue`, `/ca/revoke`) are rate limited at 300 requests per minute per API key, consistent with `/sign` and `/verify`. Read operations (`/ca/crl`, `/ca/certificate/:id`) are not rate limited.
 
 Token quota and rate limits are separate controls — check the error message to distinguish them:
 - `"Rate limit exceeded"` → back off and retry with exponential backoff
