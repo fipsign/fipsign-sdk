@@ -71,6 +71,8 @@ export interface RevokeResult {
   message:   string
   revokedAt: number
   sub:       string
+  expiresAt: number
+  note:      string
 }
 
 export interface UsageResult {
@@ -386,9 +388,9 @@ export class PQAuth {
       this.localVerify = options.localVerify ?? false
     }
 
-    if (!this.apiKey?.startsWith('pqa_')) {
+    if (!/^pqa_[0-9a-f]{64}$/.test(this.apiKey ?? '')) {
       throw new PQAuthError(
-        'Invalid API key — keys must start with "pqa_". Get one at https://app.fipsign.dev',
+        'Invalid API key format — expected "pqa_" followed by 64 hex characters. Get one at https://app.fipsign.dev',
         'INVALID_API_KEY'
       )
     }
@@ -670,10 +672,10 @@ getCrl: async (): Promise<CaGetCrlResult> => {
 
   // PQCert — already flat
   return {
-    caId:        data.caId        as string,
-    subject:     data.subject     as string,
-    crl:         (data.crl        ?? []) as CrlEntry[],
-    generatedAt: data.generatedAt as number,
+    caId:        (data.caId        as string) ?? '',
+    subject:     (data.subject     as string) ?? '',
+    crl:         (data.crl         ?? []) as CrlEntry[],
+    generatedAt: (data.generatedAt as number) ?? 0,
   }
 },
 
@@ -757,7 +759,26 @@ getCrl: async (): Promise<CaGetCrlResult> => {
           return { valid: false, error: 'Certificate has expired' }
         }
 
-        // ── Extraer public key del root cert ────────────────────────────────
+        // ── Verificar algoritmo de firma ────────────────────────────────────────
+        const OID_ML_DSA_65 = '2.16.840.1.101.3.4.3.18'
+
+        const certAlg = cert.signatureAlgorithm.algorithm
+        if (certAlg !== OID_ML_DSA_65) {
+          return {
+            valid: false,
+            error: `Unsupported signature algorithm: ${certAlg}. Expected ML-DSA-65 (${OID_ML_DSA_65})`,
+          }
+        }
+
+        const rootAlg = root.signatureAlgorithm.algorithm
+        if (rootAlg !== OID_ML_DSA_65) {
+          return {
+            valid: false,
+            error: `Unsupported root CA algorithm: ${rootAlg}. Expected ML-DSA-65 (${OID_ML_DSA_65})`,
+          }
+        }
+
+        // ── Extraer public key del root cert ────────────────────────────────────
         // subjectPublicKeyInfo.subjectPublicKey es un ArrayBuffer del BIT STRING content.
         // Dependiendo de la versión de @peculiar/asn1-x509, puede incluir o no
         // el byte 0x00 de unused-bits al inicio. ML-DSA-65 public key = 1952 bytes raw.
@@ -833,9 +854,7 @@ getCrl: async (): Promise<CaGetCrlResult> => {
       let token: PQToken
       try {
         const b64     = headerValue.slice(7)
-        const decoded = typeof atob !== 'undefined'
-          ? atob(b64)
-          : Buffer.from(b64, 'base64').toString('utf8')
+        const decoded = atob(b64)
         token = JSON.parse(decoded)
       } catch {
         return res.status(401).json({ error: 'Invalid token format' })

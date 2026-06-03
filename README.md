@@ -241,9 +241,22 @@ monthlyHistory.forEach(({ month, tokensUsed, fromFree, fromPack }) => {
 })
 
 // Purchased packs
-packs.forEach(({ packType, tokensPurchased, purchasedAt }) => {
+packs.forEach(({ id, packType, tokensPurchased, purchasedAt, paymentRef }) => {
   console.log(`${packType}: ${tokensPurchased} tokens — ${new Date(purchasedAt * 1000).toLocaleDateString()}`)
+  console.log(`  id: ${id} — paymentRef: ${paymentRef ?? 'n/a'}`)
 })
+```
+
+---
+
+## health() — Service status
+
+```typescript
+const { status, algorithm, quantumResistant, version } = await fipsign.health()
+console.log(status)           // "ok"
+console.log(algorithm)        // "ML-DSA-65"
+console.log(quantumResistant) // true
+console.log(version)          // e.g. "2.0.0"
 ```
 
 ---
@@ -275,6 +288,74 @@ await fipsign.webhooks.delete()
 ```
 
 Re-registering an existing webhook updates the URL and events but preserves the original secret. To rotate the secret, delete and re-register.
+
+### Webhook event payloads
+
+Each incoming POST has a top-level `event` string and a `data` object. The fields available in `data` depend on the event type:
+
+**`token.signed`**
+```typescript
+{
+  sub:            string,   // subject passed to sign()
+  email:          string | null,
+  role:           string | null,
+  projectId:      string,
+  apiKeyName:     string,
+  tokensUsed:     number,
+  freeRemaining:  number,
+  packRemaining:  number,
+  totalRemaining: number,
+  source:         string,   // "free" | "pack" | "free+pack"
+  month:          string,   // e.g. "2026-05"
+}
+```
+
+**`token.rejected`**
+```typescript
+{
+  reason:     string,         // why verification failed
+  sub:        string | null,  // subject extracted from payload (if decodable)
+  projectId:  string,
+  apiKeyName: string,
+}
+```
+
+**`token.revoked`**
+```typescript
+{
+  sub:            string,
+  reason:         string,
+  apiKeyName:     string,
+  projectId:      string,
+  freeRemaining:  number,
+  packRemaining:  number,
+  totalRemaining: number,
+}
+```
+
+**`limit.warning`** — fired when free tokens drop below 20% of monthly limit
+```typescript
+{
+  freeRemaining:  number,
+  freeLimit:      number,   // always 10000
+  packRemaining:  number,
+  totalRemaining: number,
+  percentUsed:    number,   // e.g. 82
+  month:          string,
+  apiKeyName:     string,
+}
+```
+
+**`limit.reached`** — fired when free tokens are exhausted and no pack is available
+```typescript
+{
+  freeRemaining:  number,   // always 0
+  packRemaining:  number,
+  totalRemaining: number,
+  month:          string,
+  apiKeyName:     string,
+}
+```
 
 ### Verifying incoming webhook requests
 
@@ -374,6 +455,13 @@ console.log(certificate.id)        // cert_...
 console.log(certificate.caId)      // ca_... — the CA that signed it
 console.log(certificate.expiresAt) // Unix timestamp
 console.log(meta.certId)           // same as certificate.id
+console.log(meta.caId)             // ca_...
+console.log(meta.subject)          // 'device-serial-00123'
+console.log(meta.format)           // 'pqcert'
+console.log(meta.issuedAt)         // Unix timestamp
+console.log(meta.expiresAt)        // Unix timestamp
+console.log(meta.algorithm)        // 'ML-DSA-65'
+console.log(meta.standard)         // 'NIST FIPS 204'
 
 
 // X.509 CA
@@ -388,12 +476,17 @@ console.log(typeof certificate)    // "string"
 console.log(certificate)           // "-----BEGIN CERTIFICATE-----\n..."
 console.log(meta.certId)           // cert_... — use this for revocation
 console.log(meta.caId)             // ca_...
+console.log(meta.subject)          // 'device-serial-00123'
+console.log(meta.format)           // 'x509'
+console.log(meta.issuedAt)         // Unix timestamp
 console.log(meta.expiresAt)        // Unix timestamp
+console.log(meta.algorithm)        // 'ML-DSA-65'
+console.log(meta.standard)         // 'NIST FIPS 204'
 ```
 
 > **Note for X.509:** The `meta.certId` returned by `ca.issue()` is what you need for `ca.revokeCert()` and `ca.isCertRevoked()`. Store it alongside the PEM certificate.
 
-> **Note for X.509:** The `meta` option (custom key-value pairs) is supported for PQCert CAs only. If passed when using an X.509 CA, it is silently ignored by the server — custom attributes should be encoded in the certificate `subject` or stored separately.
+> **Note for X.509:** The `meta` option (custom key-value pairs) is supported for PQCert CAs only. Passing `meta` when using an X.509 CA returns a 400 error — custom attributes should be encoded in the certificate `subject` or stored separately in your own database.
 
 ---
 
@@ -432,7 +525,12 @@ For PQCert certificates use `ca.verifyCert()` instead.
 const result = await fipsign.ca.verifyX509Cert(deviceCertPem, rootCertPem)
 
 if (!result.valid) {
-  console.error(result.error) // 'Certificate has expired', 'Invalid certificate signature', etc.
+  // Possible error messages:
+  //   'Certificate has expired'
+  //   'Invalid certificate signature — not signed by this root CA'
+  //   'Unsupported signature algorithm: <OID>. Expected ML-DSA-65 (2.16.840.1.101.3.4.3.18)'
+  //   'Unsupported root CA algorithm: <OID>. Expected ML-DSA-65 (2.16.840.1.101.3.4.3.18)'
+  console.error(result.error)
   return reject('Device not authorized')
 }
 
@@ -497,7 +595,7 @@ if (raw) {
 Retrieve a certificate and its current status directly from the server. Use this when you need the real-time revocation status of a specific certificate — for example, before authorizing a high-value operation. Free — no token cost.
 
 ```typescript
-const { certificate, status } = await fipsign.ca.getCert('cert_...')
+const { certificate, status, meta } = await fipsign.ca.getCert('cert_...')
 
 console.log(status.revoked)   // boolean
 console.log(status.expired)   // boolean
@@ -506,6 +604,14 @@ console.log(status.expiresAt) // Unix timestamp
 
 // For PQCert CAs, certificate is a PQCert object
 // For X.509 CAs, certificate is a PEM string
+// For X.509 CAs, meta contains additional fields:
+if (meta) {
+  console.log(meta.certId)    // cert_...
+  console.log(meta.caId)      // ca_...
+  console.log(meta.subject)   // 'device-serial-00123'
+  console.log(meta.format)    // 'x509'
+  console.log(meta.algorithm) // 'ML-DSA-65'
+}
 ```
 
 ---
@@ -515,8 +621,15 @@ console.log(status.expiresAt) // Unix timestamp
 Revoke a certificate immediately. It will appear in the CRL from this point on. Cost: 1 token.
 
 ```typescript
-await fipsign.ca.revokeCert('cert_...', 'device decommissioned')
-await fipsign.ca.revokeCert('cert_...', 'device reported stolen')
+const { certId, revokedAt, reason, usage } = await fipsign.ca.revokeCert(
+  'cert_...',
+  'device decommissioned'
+)
+
+console.log(certId)              // cert_...
+console.log(revokedAt)           // Unix timestamp
+console.log(reason)              // 'device decommissioned' (or null if omitted)
+console.log(usage.freeRemaining) // tokens remaining after this operation
 ```
 
 ---
@@ -603,7 +716,7 @@ try {
 } catch (err) {
   if (err instanceof PQAuthError) {
     switch (err.code) {
-      case 'INVALID_API_KEY':       // key missing or doesn't start with pqa_
+      case 'INVALID_API_KEY':       // key format invalid — must be pqa_ + 64 hex chars
         break
       case 'API_ERROR':             // server returned an error (check err.status)
         break
@@ -645,7 +758,7 @@ Each of these operations costs **1 token**: signing (`/sign`), verification (`/v
 
 ## Rate limits
 
-300 requests per minute per API key on `/sign`, `/verify`, and `/revoke`. On excess the API returns HTTP 429.
+300 requests per minute per API key on `/sign` and `/verify`. On excess the API returns HTTP 429.
 
 CA operations (`/ca/issue`, `/ca/revoke`) are rate limited at 300 requests per minute per API key, consistent with `/sign` and `/verify`. Read operations (`/ca/crl`, `/ca/certificate/:id`) are not rate limited.
 
@@ -659,7 +772,7 @@ Token quota and rate limits are separate controls — check the error message to
 
 ```typescript
 const fipsign = new PQAuth({
-  apiKey:      'pqa_...',                    // required — must start with pqa_
+  apiKey:      'pqa_...',                    // required — 68-character key (pqa_ + 64 hex chars)
   baseUrl:     'https://api.fipsign.dev',    // optional, override for self-hosting
   timeout:     10_000,                       // optional, ms (default: 10000)
   localVerify: false,                        // optional, in-memory verification (default: false)
@@ -668,7 +781,7 @@ const fipsign = new PQAuth({
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `apiKey` | string | — | Required. From the dashboard. Constructor throws immediately if not prefixed with `pqa_`. |
+| `apiKey` | string | — | Required. From the dashboard. Constructor throws `INVALID_API_KEY` immediately if the key does not match the format `pqa_` followed by 64 lowercase hex characters. |
 | `baseUrl` | string | `https://api.fipsign.dev` | Override for local dev or self-hosted instances. |
 | `timeout` | number | `10000` | Request timeout in ms. Throws `TIMEOUT` on exceeded. |
 | `localVerify` | boolean | `false` | When true, `verify()` runs in memory using a cached public key (refreshed every hour). No API call, no token cost. Does not check revocation. |
@@ -685,5 +798,6 @@ JWT with RS256/ES256 and standard OAuth tokens use ECDSA or RSA — both vulnera
 
 - Dashboard: [app.fipsign.dev](https://app.fipsign.dev)
 - Developer guide: [fipsign.dev/guide](https://fipsign.dev/guide)
-- API status: [api.fipsign.dev/health](https://api.fipsign.dev/health)
+- API status: [status.fipsign.dev](https://status.fipsign.dev)
+- API health: [api.fipsign.dev/health](https://api.fipsign.dev/health)
 - NIST FIPS 204: [csrc.nist.gov/pubs/fips/204/final](https://csrc.nist.gov/pubs/fips/204/final)

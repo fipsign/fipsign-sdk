@@ -9,16 +9,18 @@
  *   node test-sdk.mjs
  *
  * Optional:
- *   FIPSIGN_ROOT_CERT_JSON='$(cat root-cert.json)'   — enables offline verifyCert() tests
+ *   FIPSIGN_ROOT_CERT_JSON='$(cat root-cert.json)'  — enables offline verifyCert() tests (PQCert CA)
+ *   FIPSIGN_ROOT_CERT_PEM='$(cat root-cert.pem)'   — enables offline verifyX509Cert() tests (X.509 CA)
  *
  * Prerequisites:
  *   1. Create a free account at https://app.fipsign.dev
  *   2. Create a project and an API key inside that project
- *   3. Create a CA for that project from the dashboard
+ *   3. Create a CA for that project from the dashboard (PQCert or X.509)
  *   4. Create a free endpoint at https://webhook.site and copy your UUID
- *   5. npm install fipsign-sdk
+ *   5. npm install fipsign-sdk @noble/post-quantum
  */
 
+import { createHmac } from 'crypto'
 import { PQAuth, PQAuthError } from 'fipsign-sdk'
 import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js'
 
@@ -89,7 +91,7 @@ async function run() {
 
   const pq = new PQAuth(API_KEY)
 
-  // ─── 01 Health ──────────────────────────────────────────────────────────────
+  // ─── 01 Health check ────────────────────────────────────────────────────────
   section('01 · Health check')
   try {
     const h = await pq.health()
@@ -97,27 +99,67 @@ async function run() {
     if (h.algorithm !== 'ML-DSA-65') throw new Error('algorithm is "' + h.algorithm + '", expected "ML-DSA-65"')
     if (!h.quantumResistant)         throw new Error('quantumResistant is false')
     if (!h.version)                  throw new Error('missing version field')
+    if (h.standard !== 'NIST FIPS 204') throw new Error('standard is "' + h.standard + '", expected "NIST FIPS 204"')
     log('status',           h.status)
     log('algorithm',        h.algorithm)
+    log('standard',         h.standard)
     log('quantumResistant', String(h.quantumResistant))
     log('version',          h.version)
     pass('health() returns correct fields')
   } catch (err) { fail('health()', err) }
 
-  // ─── 02 Invalid API key ──────────────────────────────────────────────────────
+  // ─── 02 Invalid API key rejection ───────────────────────────────────────────
   section('02 · Invalid API key rejection')
+
+  // Original case — wrong prefix
   try {
     new PQAuth('bad_key')
-    fail('constructor rejects bad key', new Error('should have thrown'))
+    fail('constructor rejects wrong prefix', new Error('should have thrown'))
   } catch (err) {
     if (err instanceof PQAuthError && err.code === 'INVALID_API_KEY') {
-      pass('constructor throws PQAuthError(INVALID_API_KEY) for bad key')
+      pass('constructor throws INVALID_API_KEY for wrong prefix')
     } else {
-      fail('constructor rejects bad key', err)
+      fail('constructor rejects wrong prefix', err)
     }
   }
 
-  // ─── 03 sign() ───────────────────────────────────────────────────────────────
+  // Post-fix 3.3 — pqa_ prefix only, no content
+  try {
+    new PQAuth('pqa_')
+    fail('constructor rejects pqa_ with no content', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'INVALID_API_KEY') {
+      pass('constructor throws INVALID_API_KEY for pqa_ with no content')
+    } else {
+      fail('constructor rejects pqa_ with no content', err)
+    }
+  }
+
+  // Post-fix 3.3 — pqa_ + too short
+  try {
+    new PQAuth('pqa_abc123')
+    fail('constructor rejects pqa_ + too short', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'INVALID_API_KEY') {
+      pass('constructor throws INVALID_API_KEY for pqa_ + too short')
+    } else {
+      fail('constructor rejects pqa_ + too short', err)
+    }
+  }
+
+  // Post-fix 3.3 — pqa_ + 64 non-hex chars
+  try {
+    new PQAuth('pqa_' + 'Z'.repeat(64))
+    fail('constructor rejects pqa_ + non-hex chars', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'INVALID_API_KEY') {
+      pass('constructor throws INVALID_API_KEY for pqa_ + non-hex chars')
+    } else {
+      fail('constructor rejects pqa_ + non-hex chars', err)
+    }
+  }
+
+  // ─── 03 sign() ──────────────────────────────────────────────────────────────
   section('03 · sign()')
   let userToken, orderToken, docToken
 
@@ -163,6 +205,7 @@ async function run() {
     pass('sign() document — custom fields accepted')
   } catch (err) { fail('sign() document', err) }
 
+  // sub missing or empty
   try {
     await pq.sign({ sub: '' })
     fail('sign() rejects empty sub', new Error('should have thrown'))
@@ -185,6 +228,7 @@ async function run() {
     }
   }
 
+  // >10 custom fields
   try {
     await pq.sign({
       sub: 'test_fields',
@@ -200,7 +244,19 @@ async function run() {
     }
   }
 
-  // ─── 04 verify() remote ──────────────────────────────────────────────────────
+  // sub too long (>128 chars)
+  try {
+    await pq.sign({ sub: 'x'.repeat(129) })
+    fail('sign() rejects sub > 128 chars', new Error('should have thrown'))
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'API_ERROR' && err.status === 400) {
+      pass('sign() throws API_ERROR(400) when sub > 128 chars')
+    } else {
+      fail('sign() rejects sub > 128 chars', err)
+    }
+  }
+
+  // ─── 04 verify() remote ─────────────────────────────────────────────────────
   section('04 · verify() — remote')
 
   if (userToken) {
@@ -245,7 +301,7 @@ async function run() {
     } catch (err) { fail('verify() order token', err) }
   }
 
-  // ─── 05 verify() local ───────────────────────────────────────────────────────
+  // ─── 05 verify() local ──────────────────────────────────────────────────────
   section('05 · verify() — local (offline)')
 
   const pqLocal = new PQAuth({ apiKey: API_KEY, localVerify: true })
@@ -278,7 +334,7 @@ async function run() {
     } catch (err) { fail('verify() local — tampered token', err) }
   }
 
-  // ─── 06 revoke() ─────────────────────────────────────────────────────────────
+  // ─── 06 revoke() ────────────────────────────────────────────────────────────
   section('06 · revoke()')
   let revokedToken
 
@@ -334,7 +390,7 @@ async function run() {
     }
   }
 
-  // ─── 07 Expired token ────────────────────────────────────────────────────────
+  // ─── 07 Expired token ───────────────────────────────────────────────────────
   section('07 · Expired token')
   try {
     const r = await pq.sign({ sub: 'expiry_test', expiresInSeconds: 1 })
@@ -349,7 +405,7 @@ async function run() {
     pass('verify() expired token — returns valid:false')
   } catch (err) { fail('expired token test', err) }
 
-  // ─── 08 usage() ──────────────────────────────────────────────────────────────
+  // ─── 08 usage() ─────────────────────────────────────────────────────────────
   section('08 · usage()')
   try {
     const r = await pq.usage()
@@ -373,7 +429,7 @@ async function run() {
     pass('usage() — correct shape, all fields present, 6-month history')
   } catch (err) { fail('usage()', err) }
 
-  // ─── 09 Local verify — revoked token passes (expected behavior) ──────────────
+  // ─── 09 Local verify — revoked token passes (expected behavior) ─────────────
   section('09 · Local verify — revoked token passes (expected behavior)')
   try {
     const r = await pq.sign({ sub: 'revoke_local_test', expiresInSeconds: 3600 })
@@ -392,11 +448,11 @@ async function run() {
     pass('verify() local — revoked token passes (does not check revocation list — use remote for sensitive ops)')
   } catch (err) { fail('local verify revoked token test', err) }
 
-  // ─── 10 Default expiry ───────────────────────────────────────────────────────
+  // ─── 10 Default expiry ──────────────────────────────────────────────────────
   section('10 · sign() — default expiry (no expiresInSeconds)')
   try {
     const r = await pq.sign({ sub: 'default_expiry_test' })
-    const payload = JSON.parse(Buffer.from(r.token.payload, 'base64').toString('utf8'))
+    const payload = JSON.parse(atob(r.token.payload))
     const expectedExp = payload.iat + 3600
     const diff = Math.abs(payload.exp - expectedExp)
     if (diff > 5) throw new Error('exp is ' + payload.exp + ', expected ~' + expectedExp + ' (1 hour from iat)')
@@ -406,7 +462,7 @@ async function run() {
     pass('sign() — default expiresInSeconds is 3600 (1 hour)')
   } catch (err) { fail('sign() default expiry', err) }
 
-  // ─── 11 Malformed tokens ─────────────────────────────────────────────────────
+  // ─── 11 Malformed tokens ────────────────────────────────────────────────────
   section('11 · verify() — malformed token shapes')
   try {
     const r = await pq.verify({ payload: '', signature: '', algorithm: 'ML-DSA-65', issuedAt: 0 })
@@ -433,8 +489,8 @@ async function run() {
     pass('verify() empty object — returns valid:false without throwing')
   } catch (err) { fail('verify() empty object', err) }
 
-  // ─── 12 Webhooks ─────────────────────────────────────────────────────────────
-  section('12 · webhooks — get before register, register, get, test, delete')
+  // ─── 12 Webhooks ────────────────────────────────────────────────────────────
+  section('12 · webhooks — get, register, secret preservation, get, test, delete')
 
   try {
     await pq.webhooks.delete().catch(() => {})
@@ -444,6 +500,7 @@ async function run() {
     pass('webhooks.get() before register — returns null')
   } catch (err) { fail('webhooks.get() before register', err) }
 
+  let webhookSecret
   try {
     const { webhook } = await pq.webhooks.register({
       url:    WEBHOOK_URL,
@@ -452,11 +509,24 @@ async function run() {
     if (!webhook.url)                   throw new Error('missing webhook.url')
     if (!webhook.secret)                throw new Error('missing webhook.secret')
     if (!Array.isArray(webhook.events)) throw new Error('events is not an array')
+    webhookSecret = webhook.secret
     log('url',    webhook.url)
     log('events', webhook.events.join(', '))
     log('secret', webhook.secret.slice(0, 8) + '...')
     pass('webhooks.register() — webhook created with secret')
   } catch (err) { fail('webhooks.register()', err) }
+
+  // Re-register preserves the secret
+  try {
+    const { webhook } = await pq.webhooks.register({
+      url:    WEBHOOK_URL,
+      events: ['token.signed', 'token.revoked'],
+    })
+    if (!webhook.secret)                   throw new Error('missing webhook.secret on re-register')
+    if (webhook.secret !== webhookSecret)  throw new Error('secret changed on re-register — expected same secret')
+    log('secret preserved', webhook.secret.slice(0, 8) + '...')
+    pass('webhooks.register() re-register — secret preserved, events updated')
+  } catch (err) { fail('webhooks.register() re-register secret preservation', err) }
 
   try {
     const { webhook } = await pq.webhooks.get()
@@ -483,7 +553,7 @@ async function run() {
     pass('webhooks.delete() — webhook removed, get() returns null')
   } catch (err) { fail('webhooks.delete()', err) }
 
-  // ─── 13 Independent ML-DSA-65 signature verification ─────────────────────────
+  // ─── 13 Independent ML-DSA-65 signature verification ────────────────────────
   section('13 · Independent ML-DSA-65 signature verification')
   try {
     const pkResp = await fetch('https://api.fipsign.dev/public-key')
@@ -526,11 +596,15 @@ async function run() {
     pass('signing same payload twice produces distinct signatures — no replay vulnerability')
   } catch (err) { fail('distinct signatures test', err) }
 
-  // ─── 15 Webhook delivery confirmation ────────────────────────────────────────
-  section('15 · Webhook delivery confirmation')
+  // ─── 15 Webhook delivery + HMAC signature verification ──────────────────────
+  section('15 · Webhook delivery + HMAC signature verification')
   try {
     await pq.webhooks.delete().catch(() => {})
-    await pq.webhooks.register({ url: WEBHOOK_URL, events: ['token.signed'] })
+    const { webhook: registeredWebhook } = await pq.webhooks.register({
+      url:    WEBHOOK_URL,
+      events: ['token.signed'],
+    })
+    const secret = registeredWebhook.secret
 
     const uniqueSub = 'webhook_delivery_test_' + Date.now()
     await pq.sign({ sub: uniqueSub, expiresInSeconds: 300 })
@@ -566,17 +640,44 @@ async function run() {
     log('delivered', 'yes ✓')
     pass('webhook delivered and confirmed — event arrived with correct payload')
 
-    await pq.webhooks.delete()
-  } catch (err) { fail('webhook delivery confirmation', err) }
+// Verify HMAC signature
+    const rawBody = typeof found.content === 'string' ? found.content : JSON.stringify(found.content)
 
-  // ─── 16 Certificate Authority ─────────────────────────────────────────────
+    // webhook.site may return headers as object or as array of { name, value }
+    let sigHeader = ''
+    if (found.headers) {
+      if (typeof found.headers === 'object' && !Array.isArray(found.headers)) {
+        sigHeader = String(found.headers['x-pqauth-signature'] ?? found.headers['X-PQAuth-Signature'] ?? '').trim()
+      } else if (Array.isArray(found.headers)) {
+        const entry = found.headers.find(h => h.name?.toLowerCase() === 'x-pqauth-signature')
+        sigHeader = String(entry?.value ?? '').trim()
+      }
+    }
+    if (!sigHeader) throw new Error('X-PQAuth-Signature header missing from webhook request')
+
+    const expectedSig = 'sha256=' + createHmac('sha256', secret)
+      .update(rawBody)
+      .digest('hex')
+
+    const { timingSafeEqual } = await import('crypto')
+    const sigOk = sigHeader.length === expectedSig.length &&
+      timingSafeEqual(Buffer.from(sigHeader), Buffer.from(expectedSig))
+    if (!sigOk) {
+      throw new Error('HMAC signature mismatch\n      received: ' + sigHeader + '\n      expected: ' + expectedSig)
+    }
+    log('signature', 'verified ✓')
+    pass('webhook HMAC signature verified — X-PQAuth-Signature matches')
+
+    await pq.webhooks.delete()
+  } catch (err) { fail('webhook delivery + HMAC verification', err) }
+
+  // ─── 16 Certificate Authority ───────────────────────────────────────────────
   section('16 · Certificate Authority')
 
   const ROOT_CERT_JSON = process.env.FIPSIGN_ROOT_CERT_JSON
     ? JSON.parse(process.env.FIPSIGN_ROOT_CERT_JSON)
     : null
 
-  // X.509 root cert PEM — set this when testing against an X.509 CA
   const ROOT_CERT_PEM = process.env.FIPSIGN_ROOT_CERT_PEM ?? null
 
   if (!ROOT_CERT_JSON && !ROOT_CERT_PEM) {
@@ -594,51 +695,83 @@ async function run() {
     if (!kp.secretKey)  throw new Error('missing secretKey')
     if (typeof kp.publicKey !== 'string') throw new Error('publicKey must be a string')
     if (typeof kp.secretKey !== 'string') throw new Error('secretKey must be a string')
-    const decoded = atob(kp.publicKey)
-    if (decoded.length === 0) throw new Error('publicKey decoded to empty bytes')
-    log('publicKey length',  String(atob(kp.publicKey).length) + ' bytes')
-    log('secretKey length',  String(atob(kp.secretKey).length) + ' bytes')
+    const pkBytes = atob(kp.publicKey)
+    if (pkBytes.length === 0) throw new Error('publicKey decoded to empty bytes')
+    // ML-DSA-65: public key = 1952 bytes, secret key = 4032 bytes
+    if (pkBytes.length !== 1952) throw new Error('publicKey is ' + pkBytes.length + ' bytes, expected 1952')
+    if (atob(kp.secretKey).length !== 4032) throw new Error('secretKey is not 4032 bytes')
+    log('publicKey length', String(pkBytes.length) + ' bytes')
+    log('secretKey length', String(atob(kp.secretKey).length) + ' bytes')
     devicePublicKey = kp.publicKey
     deviceSecretKey = kp.secretKey
-    pass('generateKeyPair() — ML-DSA-65 key pair generated')
+    pass('generateKeyPair() — ML-DSA-65 key pair generated with correct sizes')
   } catch (err) { fail('generateKeyPair()', err) }
 
   // 16.2 ca.issue()
-  // Detect CA format from the certificate field:
-  //   PQCert → r.certificate is an object with .type, .id, .signature, etc.
-  //   X.509  → r.certificate is a PEM string starting with "-----BEGIN CERTIFICATE-----"
-  let issuedCert, issuedCertId
+  // Strategy: attempt with meta first.
+  //   - If OK → PQCert CA (meta supported)
+  //   - If 400 → X.509 CA (meta not supported, post-fix 1.2) → retry without meta
+  // This also exercises the X.509 meta rejection as expected behavior.
+  let issuedCert, issuedCertId, caFormat
   try {
     if (!devicePublicKey) throw new Error('skipped — generateKeyPair() failed')
-    const r = await pq.ca.issue({
-      subject:          'device-test-' + Date.now(),
-      publicKey:        devicePublicKey,
-      expiresInSeconds: 86400,
-      meta:             { env: 'test', sdk: 'fipsign-sdk' },
-    })
+
+    const subject = 'device-test-' + Date.now()
+    let r
+
+    try {
+      // Attempt with meta — works for PQCert, rejected for X.509
+      r = await pq.ca.issue({
+        subject,
+        publicKey:        devicePublicKey,
+        expiresInSeconds: 86400,
+        meta:             { env: 'test', sdk: 'fipsign-sdk' },
+      })
+      caFormat = 'pqcert'
+      log('meta', 'accepted → PQCert CA detected')
+    } catch (metaErr) {
+      if (metaErr instanceof PQAuthError && metaErr.status === 400 && metaErr.message.includes('meta')) {
+        // X.509 CA — expected behavior post-fix 1.2
+        log('meta', 'rejected with 400 → X.509 CA detected (expected)')
+        pass('ca.issue() — X.509 CA correctly rejects meta with 400')
+        r = await pq.ca.issue({
+          subject,
+          publicKey:        devicePublicKey,
+          expiresInSeconds: 86400,
+        })
+        caFormat = 'x509'
+      } else {
+        throw metaErr
+      }
+    }
+
     if (!r.certificate)           throw new Error('missing certificate')
     if (!r.meta.certId)           throw new Error('missing meta.certId')
+    if (!r.meta.caId)             throw new Error('missing meta.caId')
+    if (!r.meta.subject)          throw new Error('missing meta.subject')
+    if (!r.meta.format)           throw new Error('missing meta.format')
+    if (!r.meta.issuedAt)         throw new Error('missing meta.issuedAt')
+    if (!r.meta.expiresAt)        throw new Error('missing meta.expiresAt')
+    if (!r.meta.algorithm)        throw new Error('missing meta.algorithm')
+    if (!r.meta.standard)         throw new Error('missing meta.standard')
     if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage.freeRemaining')
 
-    const isX509 = typeof r.certificate === 'string'
-
-    if (isX509) {
-      // X.509 — certificate is a PEM string, metadata comes from meta
-      if (!r.certificate.includes('BEGIN CERTIFICATE')) throw new Error('X.509 certificate is not a valid PEM string')
-      if (!r.meta.caId)      throw new Error('missing meta.caId')
-      if (!r.meta.expiresAt) throw new Error('missing meta.expiresAt')
-      log('format',    'x509')
-      log('certId',    r.meta.certId)
-      log('caId',      r.meta.caId)
-      log('expiresAt', new Date(r.meta.expiresAt * 1000).toISOString())
+    if (caFormat === 'x509') {
+      if (typeof r.certificate !== 'string') throw new Error('X.509 certificate must be a PEM string')
+      if (!r.certificate.includes('BEGIN CERTIFICATE')) throw new Error('not a valid PEM string')
+      log('format',     'x509')
+      log('certId',     r.meta.certId)
+      log('caId',       r.meta.caId)
+      log('issuedAt',   new Date(r.meta.issuedAt * 1000).toISOString())
+      log('expiresAt',  new Date(r.meta.expiresAt * 1000).toISOString())
       log('pem length', String(r.certificate.length) + ' chars')
     } else {
-      // PQCert — certificate is a JSON object
       if (r.certificate.type !== 'CA_CERT') throw new Error('expected CA_CERT, got ' + r.certificate.type)
       if (!r.certificate.id)        throw new Error('missing certificate.id')
       if (!r.certificate.signature) throw new Error('missing certificate.signature')
       if (!r.certificate.caId)      throw new Error('missing certificate.caId')
       if (!r.certificate.expiresAt) throw new Error('missing certificate.expiresAt')
+      if (r.meta.format !== 'pqcert') throw new Error('meta.format should be "pqcert", got "' + r.meta.format + '"')
       log('format',    'pqcert')
       log('certId',    r.meta.certId)
       log('caId',      r.certificate.caId)
@@ -647,9 +780,9 @@ async function run() {
       log('algorithm', r.certificate.algorithm)
     }
 
-    issuedCert   = r.certificate  // PQCert object or PEM string
+    issuedCert   = r.certificate
     issuedCertId = r.meta.certId
-    pass('ca.issue() — certificate issued with correct shape')
+    pass('ca.issue() — certificate issued with correct shape and all meta fields present')
   } catch (err) { fail('ca.issue()', err) }
 
   // 16.3 ca.issue() — expiresInSeconds below minimum (< 60)
@@ -692,6 +825,7 @@ async function run() {
   if (ROOT_CERT_JSON) {
     try {
       if (!issuedCert) throw new Error('skipped — ca.issue() failed')
+      if (caFormat !== 'pqcert') throw new Error('skipped — CA is not PQCert format')
       const result = pq.ca.verifyCert(issuedCert, ROOT_CERT_JSON)
       if (!result.valid) throw new Error('verifyCert returned invalid: ' + result.error)
       log('valid',   String(result.valid))
@@ -701,7 +835,7 @@ async function run() {
 
     // 16.5b tampered cert should fail
     try {
-      if (!issuedCert) throw new Error('skipped — ca.issue() failed')
+      if (!issuedCert || caFormat !== 'pqcert') throw new Error('skipped — not PQCert')
       const tampered = { ...issuedCert, subject: 'tampered-subject' }
       const result   = pq.ca.verifyCert(tampered, ROOT_CERT_JSON)
       if (result.valid) throw new Error('should have been invalid — cert was tampered')
@@ -712,7 +846,7 @@ async function run() {
 
     // 16.5c wrong CA should fail
     try {
-      if (!issuedCert) throw new Error('skipped — ca.issue() failed')
+      if (!issuedCert || caFormat !== 'pqcert') throw new Error('skipped — not PQCert')
       const wrongRoot = { ...ROOT_CERT_JSON, id: 'ca_wrong_id_000' }
       const result    = pq.ca.verifyCert(issuedCert, wrongRoot)
       if (result.valid) throw new Error('should have been invalid — wrong CA')
@@ -723,8 +857,7 @@ async function run() {
 
     // 16.5d expired cert should fail verifyCert()
     try {
-      if (!devicePublicKey) throw new Error('skipped — generateKeyPair() failed')
-      // Issue a cert with minimum TTL (60s), wait for it to expire, then verify
+      if (!devicePublicKey || caFormat !== 'pqcert') throw new Error('skipped — not PQCert')
       const r = await pq.ca.issue({
         subject:          'device-expire-verify-test',
         publicKey:        devicePublicKey,
@@ -740,7 +873,6 @@ async function run() {
       log('valid', String(result.valid))
       log('error', result.error)
       pass('ca.verifyCert() — expired certificate correctly rejected with CERT_EXPIRED')
-      // Clean up
       await pq.ca.revokeCert(expiredCert.id, 'expired test cert cleanup').catch(() => {})
     } catch (err) { fail('ca.verifyCert() expired cert', err) }
   } else {
@@ -751,7 +883,7 @@ async function run() {
   if (ROOT_CERT_PEM) {
     try {
       if (!issuedCert) throw new Error('skipped — ca.issue() failed')
-      if (typeof issuedCert !== 'string') throw new Error('skipped — CA is not X.509 format')
+      if (caFormat !== 'x509') throw new Error('skipped — CA is not X.509 format')
       const result = await pq.ca.verifyX509Cert(issuedCert, ROOT_CERT_PEM)
       if (!result.valid) throw new Error('verifyX509Cert returned invalid: ' + result.error)
       log('valid', String(result.valid))
@@ -761,13 +893,10 @@ async function run() {
 
     // tampered PEM should fail
     try {
-      if (!issuedCert || typeof issuedCert !== 'string') throw new Error('skipped — not X.509')
-      // Adulterar bytes en el medio del base64 (lejos de los headers y footer)
-      // Extraer las líneas de contenido y modificar una en el medio
+      if (!issuedCert || caFormat !== 'x509') throw new Error('skipped — not X.509')
       const lines = issuedCert.split('\n')
       const contentLines = lines.filter(l => l && !l.startsWith('-----'))
       const midIdx = Math.floor(contentLines.length / 2)
-      // Rotar un carácter para garantizar que el DER cambia
       const origChar = contentLines[midIdx][4]
       const newChar  = origChar === 'A' ? 'B' : 'A'
       const tamperedLine = contentLines[midIdx].slice(0, 4) + newChar + contentLines[midIdx].slice(5)
@@ -781,8 +910,7 @@ async function run() {
 
     // wrong root PEM should fail
     try {
-      if (!issuedCert || typeof issuedCert !== 'string') throw new Error('skipped — not X.509')
-      // Use the leaf cert as a fake root — signature won't match
+      if (!issuedCert || caFormat !== 'x509') throw new Error('skipped — not X.509')
       const result = await pq.ca.verifyX509Cert(issuedCert, issuedCert)
       if (result.valid) throw new Error('should have been invalid — wrong root')
       log('valid', String(result.valid))
@@ -794,39 +922,27 @@ async function run() {
   }
 
   // 16.6 ca.getCrl() — before revocation
-  // PQCert: { caId, subject, crl: CrlEntry[], generatedAt }
-  // X.509:  { crl: { caId, subject, revokedCerts: CrlEntry[], signature, ... }, generatedAt }
+  // The SDK normalizes getCrl() response — r.crl is always a flat CrlEntry[].
+  // Detect X.509 via r.raw (only present for X.509 CAs).
   let crlBefore
   try {
     const r = await pq.ca.getCrl()
     if (typeof r.generatedAt !== 'number') throw new Error('missing generatedAt')
+    if (!r.caId)                           throw new Error('missing caId')
+    if (!r.subject)                        throw new Error('missing subject')
+    if (!Array.isArray(r.crl))             throw new Error('crl is not an array')
 
-    const isX509Crl = r.crl && !Array.isArray(r.crl) && typeof r.crl === 'object'
+    const isX509 = r.raw !== undefined
+    if (isX509 && !r.raw.signature) throw new Error('X.509 CRL missing signature in raw')
 
-    let caId, subject, crlEntries
-    if (isX509Crl) {
-      // X.509 signed CRL — fields are inside r.crl
-      caId       = r.crl.caId
-      subject    = r.crl.subject
-      crlEntries = r.crl.revokedCerts
-      if (!r.crl.signature) throw new Error('X.509 CRL missing signature')
-    } else {
-      // PQCert CRL — fields are at the root
-      caId       = r.caId
-      subject    = r.subject
-      crlEntries = r.crl
-    }
+    log('caId',        r.caId)
+    log('subject',     r.subject)
+    log('crl entries', String(r.crl.length))
+    log('format',      isX509 ? 'x509 (signed CRL)' : 'pqcert')
+    if (isX509) log('signature', r.raw.signature.slice(0, 16) + '...')
 
-    if (!caId)                    throw new Error('missing caId')
-    if (!subject)                 throw new Error('missing subject')
-    if (!Array.isArray(crlEntries)) throw new Error('crl entries is not an array')
-
-    log('caId',        caId)
-    log('subject',     subject)
-    log('crl entries', String(crlEntries.length))
-    log('format',      isX509Crl ? 'x509 signed CRL' : 'pqcert')
-    crlBefore = crlEntries
-    pass('ca.getCrl() — CRL returned with correct shape')
+    crlBefore = r.crl
+    pass('ca.getCrl() — CRL returned with correct normalized shape')
   } catch (err) { fail('ca.getCrl()', err) }
 
   // 16.7 ca.isCertRevoked() — before revocation
@@ -842,19 +958,19 @@ async function run() {
   try {
     if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
     const r = await pq.ca.getCert(issuedCertId)
-    if (!r.certificate)          throw new Error('missing certificate')
-    if (!r.status)               throw new Error('missing status')
-    if (r.status.revoked)        throw new Error('cert should not be revoked yet')
-    if (r.status.expired)        throw new Error('cert should not be expired')
+    if (!r.certificate)              throw new Error('missing certificate')
+    if (!r.status)                   throw new Error('missing status')
+    if (r.status.revoked)            throw new Error('cert should not be revoked yet')
+    if (r.status.expired)            throw new Error('cert should not be expired')
     if (r.status.revokedAt !== null) throw new Error('revokedAt should be null')
-    // For PQCert: certificate is an object with .id
-    // For X.509:  certificate is a PEM string — log its length instead
+    if (typeof r.status.expiresAt !== 'number') throw new Error('missing status.expiresAt')
     const certLabel = typeof r.certificate === 'string'
       ? r.certificate.slice(0, 27) + '...'
       : r.certificate.id
-    log('certId',  certLabel)
-    log('revoked', String(r.status.revoked))
-    log('expired', String(r.status.expired))
+    log('certId',    certLabel)
+    log('revoked',   String(r.status.revoked))
+    log('expired',   String(r.status.expired))
+    log('expiresAt', new Date(r.status.expiresAt * 1000).toISOString())
     pass('ca.getCert() — certificate retrieved with correct status')
   } catch (err) { fail('ca.getCert()', err) }
 
@@ -878,7 +994,7 @@ async function run() {
     if (!r.certId)               throw new Error('missing certId')
     if (!r.revokedAt)            throw new Error('missing revokedAt')
     if (r.reason !== 'sdk integration test') throw new Error('wrong reason: ' + r.reason)
-    if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage')
+    if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage.freeRemaining')
     log('certId',    r.certId)
     log('revokedAt', new Date(r.revokedAt * 1000).toISOString())
     log('reason',    r.reason)
@@ -902,27 +1018,22 @@ async function run() {
   let crlAfter
   try {
     const r = await pq.ca.getCrl()
-    const isX509Crl = r.crl && !Array.isArray(r.crl) && typeof r.crl === 'object'
-    const crlEntries = isX509Crl ? r.crl.revokedCerts : r.crl
+    if (!Array.isArray(r.crl)) throw new Error('crl is not an array')
 
-    crlAfter = crlEntries
-    // Verify reason field — may be null if no reason was given
-    const entry = crlEntries.find(e => e.certId === issuedCertId)
+    const entry = r.crl.find(e => e.certId === issuedCertId)
     if (entry) {
       const reasonIsValid = entry.reason === null || typeof entry.reason === 'string'
       if (!reasonIsValid) throw new Error('reason must be string or null, got: ' + typeof entry.reason)
       log('reason type', entry.reason === null ? 'null' : '"' + entry.reason + '"')
     }
-    log('crl entries after revocation', String(crlEntries.length))
+    log('crl entries after revocation', String(r.crl.length))
+    crlAfter = r.crl
     pass('ca.getCrl() after revocation — CRL fetched, reason field is string or null')
   } catch (err) { fail('ca.getCrl() after revocation', err) }
 
   // 16.13 ca.isCertRevoked() — after revocation
   try {
     if (!issuedCertId || !crlAfter) throw new Error('skipped — previous steps failed')
-    // For X.509: issuedCert is a PEM string — pass issuedCertId directly.
-    // For PQCert: issuedCert is a PQCert object — isCertRevoked reads .id from it.
-    // Using issuedCertId works for both formats.
     const revoked = pq.ca.isCertRevoked(issuedCertId, crlAfter)
     if (!revoked) throw new Error('cert SHOULD be revoked now')
     log('revoked', String(revoked))
@@ -933,14 +1044,14 @@ async function run() {
   try {
     if (!issuedCertId) throw new Error('skipped — ca.issue() failed')
     const r = await pq.ca.getCert(issuedCertId)
-    if (!r.status.revoked)    throw new Error('cert should be revoked now')
-    if (!r.status.revokedAt)  throw new Error('revokedAt should be set')
+    if (!r.status.revoked)   throw new Error('cert should be revoked now')
+    if (!r.status.revokedAt) throw new Error('revokedAt should be set')
     log('revoked',   String(r.status.revoked))
     log('revokedAt', new Date(r.status.revokedAt * 1000).toISOString())
     pass('ca.getCert() after revocation — status.revoked is true')
   } catch (err) { fail('ca.getCert() after revocation', err) }
 
-  // ─── Summary ──────────────────────────────────────────────────────────────────
+  // ─── Summary ─────────────────────────────────────────────────────────────────
   const total = passed + failed
   console.log('\n' + '─'.repeat(48))
   console.log(BOLD + 'Results: ' + passed + '/' + total + ' passed' + RESET)
