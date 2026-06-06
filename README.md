@@ -1,10 +1,14 @@
 # fipsign-sdk
 
+[![npm](https://img.shields.io/npm/v/fipsign-sdk)](https://www.npmjs.com/package/fipsign-sdk)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![NIST FIPS 204](https://img.shields.io/badge/NIST-FIPS%20204-blue)](https://csrc.nist.gov/pubs/fips/204/final)
+
 Post-quantum signing SDK for Node.js and the browser.
 
 Signs and verifies any payload using **ML-DSA-65** (NIST FIPS 204) — the post-quantum digital signature standard resistant to Shor's algorithm. Standardized by NIST in August 2024.
 
-**Not just for auth.** Sign users, orders, documents, devices, events — any entity that needs a tamper-proof, quantum-resistant signature.
+**Not just for auth.** Sign users, orders, documents, devices, AI agents, events — any entity that needs a tamper-proof, quantum-resistant signature.
 
 ---
 
@@ -45,6 +49,14 @@ const { token, meta, usage } = await fipsign.sign({
   email:            'user@example.com',
   role:             'admin',
   expiresInSeconds: 3600,           // optional, default 1 hour
+})
+
+// Sign an AI agent action
+const { token } = await fipsign.sign({
+  sub:     'agent_summarizer_v2',
+  action:  'document:summarize',
+  userId:  'user_123',
+  traceId: 'trace_abc',
 })
 
 // Sign an order
