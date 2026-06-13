@@ -317,7 +317,18 @@ function verifyCertLocally(cert: PQCert, rootCert: PQCert): void {
   }
 
   const { signature, ...certWithoutSig } = cert
-  const canonical = JSON.stringify(certWithoutSig, Object.keys(certWithoutSig).sort())
+  function sortedKeys(obj: unknown): unknown {
+    if (Array.isArray(obj)) return obj.map(sortedKeys)
+    if (obj !== null && typeof obj === 'object') {
+      const sorted: Record<string, unknown> = {}
+      for (const k of Object.keys(obj as Record<string, unknown>).sort()) {
+        sorted[k] = sortedKeys((obj as Record<string, unknown>)[k])
+      }
+      return sorted
+    }
+    return obj
+  }
+  const canonical = JSON.stringify(sortedKeys(certWithoutSig))
   const msgBytes  = new TextEncoder().encode(canonical)
   const sigBytes  = fromBase64(signature)
   const pubKey    = fromBase64(rootCert.publicKey)
