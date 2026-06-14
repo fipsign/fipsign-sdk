@@ -142,3 +142,7 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
+
+# CA root certificates — never commit
+root-cert.json
+root-ca.pem

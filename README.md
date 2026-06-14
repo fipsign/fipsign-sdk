@@ -277,29 +277,13 @@ console.log(version)          // e.g. "2.0.0"
 
 **Events:** `token.signed` · `token.rejected` · `token.revoked` · `limit.warning` · `limit.reached`
 
-```typescript
-// Register
-const { webhook } = await fipsign.webhooks.register({
-  url:    'https://yourapp.com/webhooks/fipsign',
-  events: ['limit.warning', 'limit.reached', 'token.revoked'],
-})
+Webhook configuration is managed from the dashboard at [app.fipsign.dev](https://app.fipsign.dev). Go to your project → Webhooks → enter your endpoint URL and select the events you want to receive. The secret is shown once at registration time — store it securely.
 
-// Store webhook.secret securely — it won't be shown again
-console.log(webhook.secret)
+Webhooks fire automatically when you call `sign()`, `verify()`, `revoke()`, or CA operations. No SDK method needed to trigger them.
 
-// Send a test event to confirm your endpoint is reachable
-await fipsign.webhooks.test()
+### Verifying incoming webhook requests
 
-// Get current config (secret is never returned after registration)
-const { webhook: config } = await fipsign.webhooks.get()
-// config is null if no webhook has been registered yet
-if (!config) console.log('No webhook configured')
-
-// Delete
-await fipsign.webhooks.delete()
-```
-
-Re-registering an existing webhook updates the URL and events but preserves the original secret. To rotate the secret, delete and re-register.
+Each incoming POST includes `X-PQAuth-Signature` (`sha256=...`), `X-PQAuth-Event`, and `X-PQAuth-Timestamp` headers. Use `WebhookEvent` to type the event field.
 
 ### Webhook event payloads
 

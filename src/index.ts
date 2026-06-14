@@ -1,5 +1,5 @@
 /**
- * fipsign-sdk v0.6.0
+ * fipsign-sdk v0.11.0
  *
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
@@ -107,23 +107,6 @@ export type WebhookEvent =
   | 'token.revoked'
   | 'limit.warning'
   | 'limit.reached'
-
-export interface WebhookResult {
-  webhook: {
-    url:    string
-    events: WebhookEvent[]
-    secret: string
-  }
-}
-
-export interface WebhookGetResult {
-  webhook: {
-    url:       string
-    events:    WebhookEvent[]
-    active?:   boolean  // present in get() response
-    createdAt?: number  // Unix timestamp — present in get() response
-  } | null
-}
 
 export interface HealthResult {
   status:           string
@@ -579,31 +562,6 @@ export class PQAuth {
    */
   async usage(): Promise<UsageResult> {
     return this.request<UsageResult>('/usage')
-  }
-
-  // ── webhooks ────────────────────────────────────────────────────────────────
-
-  /**
-   * Manage webhook configuration for real-time event notifications.
-   *
-   * @example
-   * const { webhook } = await pqauth.webhooks.register({
-   *   url:    'https://yourapp.com/webhooks/pqauth',
-   *   events: ['limit.warning', 'limit.reached', 'token.revoked'],
-   * })
-   */
-  readonly webhooks = {
-    register: (options: { url: string; events?: WebhookEvent[] }): Promise<WebhookResult> =>
-      this.request<WebhookResult>('/webhooks', { method: 'POST', body: JSON.stringify(options) }),
-
-    get: (): Promise<WebhookGetResult> =>
-      this.request('/webhooks'),
-
-    delete: (): Promise<{ success: boolean }> =>
-      this.request('/webhooks', { method: 'DELETE' }),
-
-    test: (): Promise<{ success: boolean; message: string }> =>
-      this.request('/webhooks/test', { method: 'POST' }),
   }
 
   // ── ca ───────────────────────────────────────────────────────────────────────

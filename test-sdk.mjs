@@ -27,19 +27,10 @@ import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js'
 // ─── Required environment variables ───────────────────────────────────────────
 
 const API_KEY            = process.env.FIPSIGN_API_KEY
-const WEBHOOK_URL        = process.env.WEBHOOK_URL
-const WEBHOOK_SITE_TOKEN = process.env.WEBHOOK_SITE_TOKEN
 
 if (!API_KEY) {
   console.error('\x1b[31mError: FIPSIGN_API_KEY is required.\x1b[0m')
   console.error('Get your API key at https://app.fipsign.dev')
-  process.exit(1)
-}
-if (!WEBHOOK_URL || !WEBHOOK_SITE_TOKEN) {
-  console.error('\x1b[31mError: WEBHOOK_URL and WEBHOOK_SITE_TOKEN are required.\x1b[0m')
-  console.error('Create a free endpoint at https://webhook.site and copy your UUID.')
-  console.error('  WEBHOOK_URL=https://webhook.site/<your-uuid>')
-  console.error('  WEBHOOK_SITE_TOKEN=<your-uuid>')
   process.exit(1)
 }
 
@@ -490,68 +481,9 @@ async function run() {
   } catch (err) { fail('verify() empty object', err) }
 
   // ─── 12 Webhooks ────────────────────────────────────────────────────────────
-  section('12 · webhooks — get, register, secret preservation, get, test, delete')
-
-  try {
-    await pq.webhooks.delete().catch(() => {})
-    const { webhook } = await pq.webhooks.get()
-    if (webhook !== null) throw new Error('webhook should be null before registering')
-    log('webhook', 'null')
-    pass('webhooks.get() before register — returns null')
-  } catch (err) { fail('webhooks.get() before register', err) }
-
-  let webhookSecret
-  try {
-    const { webhook } = await pq.webhooks.register({
-      url:    WEBHOOK_URL,
-      events: ['token.signed', 'limit.warning'],
-    })
-    if (!webhook.url)                   throw new Error('missing webhook.url')
-    if (!webhook.secret)                throw new Error('missing webhook.secret')
-    if (!Array.isArray(webhook.events)) throw new Error('events is not an array')
-    webhookSecret = webhook.secret
-    log('url',    webhook.url)
-    log('events', webhook.events.join(', '))
-    log('secret', webhook.secret.slice(0, 8) + '...')
-    pass('webhooks.register() — webhook created with secret')
-  } catch (err) { fail('webhooks.register()', err) }
-
-  // Re-register preserves the secret
-  try {
-    const { webhook } = await pq.webhooks.register({
-      url:    WEBHOOK_URL,
-      events: ['token.signed', 'token.revoked'],
-    })
-    if (!webhook.secret)                   throw new Error('missing webhook.secret on re-register')
-    if (webhook.secret !== webhookSecret)  throw new Error('secret changed on re-register — expected same secret')
-    log('secret preserved', webhook.secret.slice(0, 8) + '...')
-    pass('webhooks.register() re-register — secret preserved, events updated')
-  } catch (err) { fail('webhooks.register() re-register secret preservation', err) }
-
-  try {
-    const { webhook } = await pq.webhooks.get()
-    if (!webhook)                       throw new Error('webhook is null after register')
-    if (!webhook.url)                   throw new Error('missing webhook.url')
-    if (!Array.isArray(webhook.events)) throw new Error('events is not an array')
-    if (webhook.secret)                 throw new Error('secret should not be returned by get()')
-    log('url',    webhook.url)
-    log('events', webhook.events.join(', '))
-    pass('webhooks.get() — returns webhook without secret')
-  } catch (err) { fail('webhooks.get()', err) }
-
-  try {
-    const r = await pq.webhooks.test()
-    if (!r.message) throw new Error('missing message')
-    log('message', r.message)
-    pass('webhooks.test() — test event dispatched')
-  } catch (err) { fail('webhooks.test()', err) }
-
-  try {
-    await pq.webhooks.delete()
-    const { webhook } = await pq.webhooks.get()
-    if (webhook !== null) throw new Error('webhook should be null after delete')
-    pass('webhooks.delete() — webhook removed, get() returns null')
-  } catch (err) { fail('webhooks.delete()', err) }
+  section('12 · webhooks — skipped (dashboard-only)')
+  console.log('  ' + DIM + 'ℹ Webhook management is dashboard-only. Configure at app.fipsign.dev' + RESET)
+  console.log('  ' + DIM + '  Webhooks fire automatically on sign(), verify(), revoke() events.' + RESET)
 
   // ─── 13 Independent ML-DSA-65 signature verification ────────────────────────
   section('13 · Independent ML-DSA-65 signature verification')
@@ -597,79 +529,9 @@ async function run() {
   } catch (err) { fail('distinct signatures test', err) }
 
   // ─── 15 Webhook delivery + HMAC signature verification ──────────────────────
-  section('15 · Webhook delivery + HMAC signature verification')
-  try {
-    await pq.webhooks.delete().catch(() => {})
-    const { webhook: registeredWebhook } = await pq.webhooks.register({
-      url:    WEBHOOK_URL,
-      events: ['token.signed'],
-    })
-    const secret = registeredWebhook.secret
-
-    const uniqueSub = 'webhook_delivery_test_' + Date.now()
-    await pq.sign({ sub: uniqueSub, expiresInSeconds: 300 })
-
-    console.log('  ' + DIM + 'Waiting 3 seconds for webhook delivery...' + RESET)
-    await sleep(3000)
-
-    const whResp = await fetch(
-      'https://webhook.site/token/' + WEBHOOK_SITE_TOKEN + '/requests?sorting=newest&per_page=5',
-      { headers: { 'Accept': 'application/json' } }
-    )
-
-    if (!whResp.ok) throw new Error('webhook.site API returned ' + whResp.status)
-
-    const whData   = await whResp.json()
-    const requests = whData.data ?? []
-
-    if (requests.length === 0) throw new Error('no requests received at webhook.site')
-
-    const found = requests.find(req => {
-      try {
-        const body = typeof req.content === 'string' ? JSON.parse(req.content) : req.content
-        return body?.event === 'token.signed' && body?.data?.sub === uniqueSub
-      } catch { return false }
-    })
-
-    if (!found) throw new Error('event for sub "' + uniqueSub + '" not found in recent requests')
-
-    const body = typeof found.content === 'string' ? JSON.parse(found.content) : found.content
-    log('event',     body.event)
-    log('sub',       body.data.sub)
-    log('timestamp', String(body.timestamp))
-    log('delivered', 'yes ✓')
-    pass('webhook delivered and confirmed — event arrived with correct payload')
-
-// Verify HMAC signature
-    const rawBody = typeof found.content === 'string' ? found.content : JSON.stringify(found.content)
-
-    // webhook.site may return headers as object or as array of { name, value }
-    let sigHeader = ''
-    if (found.headers) {
-      if (typeof found.headers === 'object' && !Array.isArray(found.headers)) {
-        sigHeader = String(found.headers['x-pqauth-signature'] ?? found.headers['X-PQAuth-Signature'] ?? '').trim()
-      } else if (Array.isArray(found.headers)) {
-        const entry = found.headers.find(h => h.name?.toLowerCase() === 'x-pqauth-signature')
-        sigHeader = String(entry?.value ?? '').trim()
-      }
-    }
-    if (!sigHeader) throw new Error('X-PQAuth-Signature header missing from webhook request')
-
-    const expectedSig = 'sha256=' + createHmac('sha256', secret)
-      .update(rawBody)
-      .digest('hex')
-
-    const { timingSafeEqual } = await import('crypto')
-    const sigOk = sigHeader.length === expectedSig.length &&
-      timingSafeEqual(Buffer.from(sigHeader), Buffer.from(expectedSig))
-    if (!sigOk) {
-      throw new Error('HMAC signature mismatch\n      received: ' + sigHeader + '\n      expected: ' + expectedSig)
-    }
-    log('signature', 'verified ✓')
-    pass('webhook HMAC signature verified — X-PQAuth-Signature matches')
-
-    await pq.webhooks.delete()
-  } catch (err) { fail('webhook delivery + HMAC verification', err) }
+  section('15 · Webhook delivery + HMAC — skipped (dashboard-only)')
+  console.log('  ' + DIM + 'ℹ Webhooks are configured from the dashboard, not via SDK.' + RESET)
+  console.log('  ' + DIM + '  Verify HMAC with crypto.createHmac — no SDK method needed.' + RESET)
 
   // ─── 16 Certificate Authority ───────────────────────────────────────────────
   section('16 · Certificate Authority')
