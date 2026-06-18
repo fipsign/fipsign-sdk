@@ -3,9 +3,7 @@
  * Runs against the live backend using the published fipsign-sdk
  *
  * Usage:
- *   FIPSIGN_API_KEY=pqa_...              \
- *   WEBHOOK_URL=https://webhook.site/... \
- *   WEBHOOK_SITE_TOKEN=your-uuid         \
+ *   FIPSIGN_API_KEY=pqa_... \
  *   node test-sdk.mjs
  *
  * Optional:
@@ -16,8 +14,7 @@
  *   1. Create a free account at https://app.fipsign.dev
  *   2. Create a project and an API key inside that project
  *   3. Create a CA for that project from the dashboard (PQCert or X.509)
- *   4. Create a free endpoint at https://webhook.site and copy your UUID
- *   5. npm install fipsign-sdk @noble/post-quantum
+ *   4. npm install fipsign-sdk @noble/post-quantum
  */
 
 import { createHmac } from 'crypto'
@@ -152,7 +149,7 @@ async function run() {
 
   // ─── 03 sign() ──────────────────────────────────────────────────────────────
   section('03 · sign()')
-  let userToken, orderToken, docToken
+  let userToken, orderToken, docToken, userProjectId
 
   try {
     const r = await pq.sign({ sub: 'user_test', email: 'test@example.com', role: 'admin', expiresInSeconds: 3600 })
@@ -175,6 +172,7 @@ async function run() {
     log('usage.month',   r.usage.month)
     log('freeRemaining', String(r.usage.freeRemaining))
     userToken = r.token
+    userProjectId = r.meta.projectId
     pass('sign() user session — correct shape and all fields present')
   } catch (err) { fail('sign() user session', err) }
 
@@ -295,7 +293,7 @@ async function run() {
   // ─── 05 verify() local ──────────────────────────────────────────────────────
   section('05 · verify() — local (offline)')
 
-  const pqLocal = new PQAuth({ apiKey: API_KEY, localVerify: true })
+  const pqLocal = new PQAuth({ apiKey: API_KEY, localVerify: true, projectId: userProjectId })
 
   try {
     await pqLocal.preloadPublicKey()
@@ -323,6 +321,15 @@ async function run() {
       log('local', String(r.local))
       pass('verify() local — tampered token rejected in-memory')
     } catch (err) { fail('verify() local — tampered token', err) }
+    try {
+      const wrongProjectClient = new PQAuth({ apiKey: API_KEY, localVerify: true, projectId: 'proj_wrong_for_test' })
+      const r = await wrongProjectClient.verify(userToken)
+      if (r.valid) throw new Error('expected valid:false for token from a different project')
+      if (r.error !== 'Invalid signature — token was tampered with or not issued by this server') {
+        throw new Error('unexpected error message — should be indistinguishable from INVALID_SIGNATURE: ' + r.error)
+      }
+      pass('verify() local — token from a different project rejected (ISSUER_MISMATCH, indistinguishable message)')
+    } catch (err) { fail('verify() local — issuer mismatch', err) }
   }
 
   // ─── 06 revoke() ────────────────────────────────────────────────────────────

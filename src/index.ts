@@ -1,5 +1,5 @@
 /**
- * fipsign-sdk v0.11.0
+ * fipsign-sdk v0.12.0
  *
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
@@ -17,6 +17,7 @@ export interface PQAuthOptions {
   baseUrl?:     string
   timeout?:     number
   localVerify?: boolean
+  projectId?:   string
 }
 
 export interface SignOptions {
@@ -252,15 +253,17 @@ function toBase64(bytes: Uint8Array): string {
 
 // ─── Local token verification ─────────────────────────────────────────────────
 
-function verifyLocally(token: PQToken, publicKeyB64: string): TokenPayload {
+function verifyLocally(
+  token: PQToken,
+  publicKeyB64: string,
+  expectedProjectId: string
+): TokenPayload {
   if (token.algorithm !== 'ML-DSA-65') {
     throw new PQAuthError(`Unsupported algorithm: ${token.algorithm}`, 'UNSUPPORTED_ALGORITHM')
   }
-
   const publicKey = fromBase64(publicKeyB64)
   const signature = fromBase64(token.signature)
   const message   = new TextEncoder().encode(token.payload)
-
   const isValid = ml_dsa65.verify(signature, message, publicKey)
   if (!isValid) {
     throw new PQAuthError(
@@ -268,13 +271,18 @@ function verifyLocally(token: PQToken, publicKeyB64: string): TokenPayload {
       'INVALID_SIGNATURE'
     )
   }
-
   const payload: TokenPayload = JSON.parse(atob(token.payload))
   const now = Math.floor(Date.now() / 1000)
   if (payload.exp < now) {
     throw new PQAuthError(`Token expired ${now - payload.exp} seconds ago`, 'TOKEN_EXPIRED')
   }
-
+  // ← NUEVO: validar issuer
+  if (payload._iss !== expectedProjectId) {
+    throw new PQAuthError(
+      'Invalid signature — token was tampered with or not issued by this server',
+      'ISSUER_MISMATCH'
+    )
+  }
   return payload
 }
 
@@ -366,6 +374,7 @@ export class PQAuth {
   private readonly baseUrl:     string
   private readonly timeout:     number
   private readonly localVerify: boolean
+  private readonly projectId?:  string  // ← NUEVO
   private cachedKey:            CachedKey | null = null
   private readonly keyTTL =     3600
 
@@ -375,13 +384,21 @@ export class PQAuth {
       this.baseUrl     = 'https://api.fipsign.dev'
       this.timeout     = 10_000
       this.localVerify = false
+      this.projectId   = undefined
     } else {
       this.apiKey      = options.apiKey
       this.baseUrl     = options.baseUrl     ?? 'https://api.fipsign.dev'
       this.timeout     = options.timeout     ?? 10_000
       this.localVerify = options.localVerify ?? false
+      this.projectId   = options.projectId
     }
-
+    
+    if (this.localVerify && !this.projectId) {
+      throw new PQAuthError(
+        'projectId is required when localVerify is true — get it from the dashboard or the meta.projectId field of /sign response',
+        'MISSING_PROJECT_ID'
+      )
+    }
     if (!/^pqa_[0-9a-f]{64}$/.test(this.apiKey ?? '')) {
       throw new PQAuthError(
         'Invalid API key format — expected "pqa_" followed by 64 hex characters. Get one at https://app.fipsign.dev',
@@ -516,19 +533,19 @@ export class PQAuth {
     }
   }
 
-  private async verifyLocal(token: PQToken): Promise<VerifyResult> {
-    try {
-      const publicKey = await this.getPublicKey()
-      const payload   = verifyLocally(token, publicKey)
-      return { valid: true, payload, local: true }
-    } catch (err) {
-      if (err instanceof PQAuthError && err.code === 'INVALID_SIGNATURE') {
-        this.cachedKey = null
-        try {
-          const publicKey = await this.getPublicKey()
-          const payload   = verifyLocally(token, publicKey)
-          return { valid: true, payload, local: true }
-        } catch {
+private async verifyLocal(token: PQToken): Promise<VerifyResult> {
+  try {
+    const publicKey = await this.getPublicKey()
+    const payload   = verifyLocally(token, publicKey, this.projectId!)
+    return { valid: true, payload, local: true }
+  } catch (err) {
+    if (err instanceof PQAuthError && err.code === 'INVALID_SIGNATURE') {
+      this.cachedKey = null
+      try {
+        const publicKey = await this.getPublicKey()
+        const payload   = verifyLocally(token, publicKey, this.projectId!)
+        return { valid: true, payload, local: true }
+      } catch {
           // Still invalid after key refresh — genuinely bad token
         }
       }
@@ -845,7 +862,7 @@ getCrl: async (): Promise<CaGetCrlResult> => {
    * Preload and cache the server's public key at startup.
    *
    * @example
-   * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true })
+   * const pqauth = new PQAuth({ apiKey: 'pqa_...', localVerify: true, projectId: 'proj_...' })
    * await pqauth.preloadPublicKey()
    */
   async preloadPublicKey(): Promise<void> {
