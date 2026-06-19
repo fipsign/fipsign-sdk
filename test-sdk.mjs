@@ -376,8 +376,9 @@ async function run() {
   }
 
   try {
-    const r = await pq.sign({ sub: 'expire_revoke_test', expiresInSeconds: 1 })
-    await sleep(2000)
+    const r = await pq.sign({ sub: 'expire_revoke_test', expiresInSeconds: 60 })
+    console.log('  ' + DIM + 'Waiting 62 seconds for token to expire...' + RESET)
+    await sleep(62_000)
     await pq.revoke(r.token, 'revoke after expiry')
     fail('revoke() expired token returns 400', new Error('should have thrown'))
   } catch (err) {
@@ -391,10 +392,10 @@ async function run() {
   // ─── 07 Expired token ───────────────────────────────────────────────────────
   section('07 · Expired token')
   try {
-    const r = await pq.sign({ sub: 'expiry_test', expiresInSeconds: 1 })
-    pass('sign() with expiresInSeconds:1 — token created')
-    console.log('  ' + DIM + 'Waiting 2 seconds for token to expire...' + RESET)
-    await sleep(2000)
+    const r = await pq.sign({ sub: 'expiry_test', expiresInSeconds: 60 })
+    pass('sign() with expiresInSeconds:60 — token created')
+    console.log('  ' + DIM + 'Waiting 62 seconds for token to expire...' + RESET)
+    await sleep(62_000)
     const v = await pq.verify(r.token)
     if (v.valid)  throw new Error('valid should be false for expired token')
     if (!v.error) throw new Error('missing error message')
