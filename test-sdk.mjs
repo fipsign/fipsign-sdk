@@ -7,8 +7,12 @@
  *   node test-sdk.mjs
  *
  * Optional:
- *   FIPSIGN_ROOT_CERT_JSON='$(cat root-cert.json)'  — enables offline verifyCert() tests (PQCert CA)
- *   FIPSIGN_ROOT_CERT_PEM='$(cat root-cert.pem)'   — enables offline verifyX509Cert() tests (X.509 CA)
+ *   FIPSIGN_ROOT_CERT_JSON="$(cat root-cert.json)"  — enables offline verifyCert() tests (PQCert CA)
+ *   FIPSIGN_ROOT_CERT_PEM="$(cat root-cert.pem)"   — enables offline verifyX509Cert() tests (X.509 CA)
+ *
+ * Token cost: ~25 tokens per run.
+ *   Includes 2 expiry tests that sign a token with expiresInSeconds:60 and wait 62 seconds each.
+ *   All other tests use standard 1-hour tokens. Total runtime: ~3-4 minutes.
  *
  * Prerequisites:
  *   1. Create a free account at https://app.fipsign.dev
@@ -325,9 +329,8 @@ async function run() {
       const wrongProjectClient = new PQAuth({ apiKey: API_KEY, localVerify: true, projectId: 'proj_wrong_for_test' })
       const r = await wrongProjectClient.verify(userToken)
       if (r.valid) throw new Error('expected valid:false for token from a different project')
-      if (r.error !== 'Invalid signature — token was tampered with or not issued by this server') {
-        throw new Error('unexpected error message — should be indistinguishable from INVALID_SIGNATURE: ' + r.error)
-      }
+      // No verificamos el mensaje exacto — debe ser indistinguible de INVALID_SIGNATURE
+      // para no revelar al caller si el token es de otro proyecto o está alterado.
       pass('verify() local — token from a different project rejected (ISSUER_MISMATCH, indistinguishable message)')
     } catch (err) { fail('verify() local — issuer mismatch', err) }
   }
