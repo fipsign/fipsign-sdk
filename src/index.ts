@@ -23,6 +23,10 @@ export interface PQAuthOptions {
 export interface SignOptions {
   sub:               string
   expiresInSeconds?: number
+  /**
+   * Any additional fields are stored in the token payload and returned on verify().
+   * Reserved fields: `_iss` (issuer — set automatically by the server, ignored if provided).
+   */
   [key: string]:     unknown
 }
 
@@ -104,14 +108,22 @@ export interface UsageResult {
 
 export type WebhookEvent =
   | 'token.signed'
+  | 'token.verified'
   | 'token.rejected'
   | 'token.revoked'
+  | 'token.expired'
   | 'limit.warning'
   | 'limit.reached'
+  | 'ca.issued'
+  | 'ca.revoked'
+  | 'key.rotated'
+  | 'login'
+  | 'logout'
 
 export interface HealthResult {
   status:           string
   algorithm:        string
+  standard:         string
   quantumResistant: boolean
   version:          string
 }
@@ -162,7 +174,7 @@ export interface CaIssueCertResult {
 export interface CaRevokeCertResult {
   certId:    string
   revokedAt: number
-  reason:    string | null
+  reason:    string | null | undefined  // null si no se proveyó razón, undefined para CAs PQCert
   format?:   string  // 'x509' — present for x509 CAs only
   usage: {
     freeRemaining:  number
@@ -288,6 +300,23 @@ function verifyLocally(
 
 // ─── Local certificate verification ──────────────────────────────────────────
 
+// Canonicaliza un objeto para firma — ordena keys recursivamente y serializa a JSON.
+// Debe ser idéntico al canonicalizeJson del backend (ca.ts / ca-x509.ts / utils.ts).
+function canonicalizeForSigning(obj: unknown): string {
+  function sortedKeys(o: unknown): unknown {
+    if (Array.isArray(o)) return o.map(sortedKeys)
+    if (o !== null && typeof o === 'object') {
+      const sorted: Record<string, unknown> = {}
+      for (const k of Object.keys(o as Record<string, unknown>).sort()) {
+        sorted[k] = sortedKeys((o as Record<string, unknown>)[k])
+      }
+      return sorted
+    }
+    return o
+  }
+  return JSON.stringify(sortedKeys(obj))
+}
+
 function verifyCertLocally(cert: PQCert, rootCert: PQCert): void {
   if (cert.type !== 'CA_CERT') {
     throw new PQAuthError('Expected a CA_CERT, got ' + cert.type, 'INVALID_CERT_TYPE')
@@ -308,18 +337,7 @@ function verifyCertLocally(cert: PQCert, rootCert: PQCert): void {
   }
 
   const { signature, ...certWithoutSig } = cert
-  function sortedKeys(obj: unknown): unknown {
-    if (Array.isArray(obj)) return obj.map(sortedKeys)
-    if (obj !== null && typeof obj === 'object') {
-      const sorted: Record<string, unknown> = {}
-      for (const k of Object.keys(obj as Record<string, unknown>).sort()) {
-        sorted[k] = sortedKeys((obj as Record<string, unknown>)[k])
-      }
-      return sorted
-    }
-    return obj
-  }
-  const canonical = JSON.stringify(sortedKeys(certWithoutSig))
+  const canonical = canonicalizeForSigning(certWithoutSig)
   const msgBytes  = new TextEncoder().encode(canonical)
   const sigBytes  = fromBase64(signature)
   const pubKey    = fromBase64(rootCert.publicKey)
@@ -463,7 +481,9 @@ export class PQAuth {
 
     try {
       const res  = await fetch(`${this.baseUrl}/public-key`, { signal: controller.signal })
+      if (!res.ok) throw new PQAuthError(`Failed to fetch public key: ${res.status}`, 'NETWORK_ERROR', res.status)
       const data = await res.json() as { publicKey: string }
+      if (!data.publicKey) throw new PQAuthError('Public key response missing publicKey field', 'NETWORK_ERROR')
 
       this.cachedKey = { publicKey: data.publicKey, fetchedAt: now, ttlSeconds: this.keyTTL }
       return data.publicKey
@@ -540,19 +560,19 @@ private async verifyLocal(token: PQToken): Promise<VerifyResult> {
     return { valid: true, payload, local: true }
   } catch (err) {
     if (err instanceof PQAuthError && err.code === 'INVALID_SIGNATURE') {
+      // Key may have rotated — clear cache and retry once
       this.cachedKey = null
       try {
         const publicKey = await this.getPublicKey()
         const payload   = verifyLocally(token, publicKey, this.projectId!)
         return { valid: true, payload, local: true }
-      } catch {
-          // Still invalid after key refresh — genuinely bad token
-        }
-      }
-      const message = err instanceof PQAuthError ? err.message : 'Unknown error'
-      return { valid: false, payload: null, error: message, local: true }
+      } catch { /* Still invalid after key refresh — genuinely bad token */ }
     }
+    // All errors reach here: INVALID_SIGNATURE (post-retry), TOKEN_EXPIRED, ISSUER_MISMATCH, etc.
+    const message = err instanceof PQAuthError ? err.message : 'Unknown error'
+    return { valid: false, payload: null, error: message, local: true }
   }
+}
 
   // ── revoke() ────────────────────────────────────────────────────────────────
 
@@ -661,7 +681,7 @@ getCrl: async (): Promise<CaGetCrlResult> => {
     caId:        (data.caId        as string) ?? '',
     subject:     (data.subject     as string) ?? '',
     crl:         (data.crl         ?? []) as CrlEntry[],
-    generatedAt: (data.generatedAt as number) ?? 0,
+    generatedAt: (data.generatedAt as number) ?? 0,  // 0 = backend no retornó el campo (no debería ocurrir)
   }
 },
 
@@ -878,8 +898,10 @@ async health(): Promise<HealthResult> {
   const controller = new AbortController()
   const timer      = setTimeout(() => controller.abort(), this.timeout)
   try {
-    const res = await fetch(`${this.baseUrl}/health`, { signal: controller.signal })
-    return res.json()
+    const res  = await fetch(`${this.baseUrl}/health`, { signal: controller.signal })
+    const data = await res.json() as HealthResult
+    if (!res.ok) throw new PQAuthError(`Health check failed: ${res.status}`, 'API_ERROR', res.status)
+    return data
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
       throw new PQAuthError('Request timed out', 'TIMEOUT')
