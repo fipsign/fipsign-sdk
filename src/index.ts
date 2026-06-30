@@ -108,17 +108,10 @@ export interface UsageResult {
 
 export type WebhookEvent =
   | 'token.signed'
-  | 'token.verified'
   | 'token.rejected'
   | 'token.revoked'
-  | 'token.expired'
   | 'limit.warning'
   | 'limit.reached'
-  | 'ca.issued'
-  | 'ca.revoked'
-  | 'key.rotated'
-  | 'login'
-  | 'logout'
 
 export interface HealthResult {
   status:           string
