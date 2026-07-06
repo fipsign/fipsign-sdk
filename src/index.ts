@@ -2,13 +2,13 @@
  * fipsign-sdk v0.12.0
  *
  * Post-quantum signing SDK for Node.js and the browser.
- * Uses ML-DSA-65 (NIST FIPS 204) — resistant to quantum computers.
+ * Uses ML-DSA-44, ML-DSA-65, or ML-DSA-87 (NIST FIPS 204) — resistant to quantum computers.
  *
  * Sign anything: users, orders, documents, devices, events.
  * The only required field is `sub` — any string identifying the entity.
  */
 
-import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js'
+import { ml_dsa44, ml_dsa65, ml_dsa87 } from '@noble/post-quantum/ml-dsa.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -258,18 +258,25 @@ function toBase64(bytes: Uint8Array): string {
 
 // ─── Local token verification ─────────────────────────────────────────────────
 
+function getMlDsa(algorithm: string) {
+  switch (algorithm) {
+    case 'ML-DSA-44': return ml_dsa44
+    case 'ML-DSA-65': return ml_dsa65
+    case 'ML-DSA-87': return ml_dsa87
+    default: throw new PQAuthError(`Unsupported algorithm: ${algorithm}`, 'UNSUPPORTED_ALGORITHM')
+  }
+}
+
 function verifyLocally(
   token: PQToken,
   publicKeyB64: string,
   expectedProjectId: string
 ): TokenPayload {
-  if (token.algorithm !== 'ML-DSA-65') {
-    throw new PQAuthError(`Unsupported algorithm: ${token.algorithm}`, 'UNSUPPORTED_ALGORITHM')
-  }
+  const mlDsa     = getMlDsa(token.algorithm)
   const publicKey = fromBase64(publicKeyB64)
   const signature = fromBase64(token.signature)
   const message   = new TextEncoder().encode(token.payload)
-  const isValid = ml_dsa65.verify(signature, message, publicKey)
+  const isValid = mlDsa.verify(signature, message, publicKey)
   if (!isValid) {
     throw new PQAuthError(
       'Invalid signature — token was tampered with or not issued by this server',
