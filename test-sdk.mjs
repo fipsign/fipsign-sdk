@@ -23,7 +23,7 @@
 
 import { createHmac } from 'crypto'
 import { PQAuth, PQAuthError } from 'fipsign-sdk'
-import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js'
+import { ml_dsa44, ml_dsa65, ml_dsa87 } from '@noble/post-quantum/ml-dsa.js'
 
 // ─── Required environment variables ───────────────────────────────────────────
 
@@ -88,7 +88,7 @@ async function run() {
   try {
     const h = await pq.health()
     if (h.status !== 'ok')           throw new Error('status is "' + h.status + '", expected "ok"')
-    if (h.algorithm !== 'ML-DSA-65') throw new Error('algorithm is "' + h.algorithm + '", expected "ML-DSA-65"')
+    if (!['ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87'].includes(h.algorithm)) throw new Error('unexpected algorithm: ' + h.algorithm)
     if (!h.quantumResistant)         throw new Error('quantumResistant is false')
     if (!h.version)                  throw new Error('missing version field')
     if (h.standard !== 'NIST FIPS 204') throw new Error('standard is "' + h.standard + '", expected "NIST FIPS 204"')
@@ -159,7 +159,7 @@ async function run() {
     const r = await pq.sign({ sub: 'user_test', email: 'test@example.com', role: 'admin', expiresInSeconds: 3600 })
     if (!r.token?.payload)   throw new Error('missing token.payload')
     if (!r.token?.signature) throw new Error('missing token.signature')
-    if (r.token.algorithm !== 'ML-DSA-65') throw new Error('wrong algorithm: ' + r.token.algorithm)
+    if (!['ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87'].includes(r.token.algorithm)) throw new Error('wrong algorithm: ' + r.token.algorithm)
     if (r.meta.tokenCost !== 1) throw new Error('tokenCost is ' + r.meta.tokenCost + ', expected 1')
     if (!['free', 'pack', 'free+pack'].includes(r.meta.source)) throw new Error('unexpected source: ' + r.meta.source)
     if (!r.meta.projectId)  throw new Error('missing meta.projectId')
@@ -496,27 +496,33 @@ async function run() {
   console.log('  ' + DIM + 'ℹ Webhook management is dashboard-only. Configure at app.fipsign.dev' + RESET)
   console.log('  ' + DIM + '  Webhooks fire automatically on sign(), verify(), revoke() events.' + RESET)
 
-  // ─── 13 Independent ML-DSA-65 signature verification ────────────────────────
-  section('13 · Independent ML-DSA-65 signature verification')
+  // ─── 13 Independent ML-DSA signature verification ───────────────────────────
+  section('13 · Independent ML-DSA signature verification (44/65/87)')
   try {
-    const pkResp = await fetch('https://api.fipsign.dev/public-key')
+    const pkResp = await fetch('https://api.fipsign.dev/public-key', {
+      headers: { 'X-API-Key': API_KEY }
+    })
     const pkData = await pkResp.json()
     if (!pkData.publicKey) throw new Error('could not fetch public key')
 
     const { token } = await pq.sign({ sub: 'crypto_verify_test', expiresInSeconds: 3600 })
 
+    const mlDsaMap = { 'ML-DSA-44': ml_dsa44, 'ML-DSA-65': ml_dsa65, 'ML-DSA-87': ml_dsa87 }
+    const mlDsa    = mlDsaMap[token.algorithm]
+    if (!mlDsa) throw new Error('Unsupported algorithm: ' + token.algorithm)
+
     const publicKey = fromBase64(pkData.publicKey)
     const signature = fromBase64(token.signature)
     const message   = new TextEncoder().encode(token.payload)
 
-    const isValid = ml_dsa65.verify(signature, message, publicKey)
-    if (!isValid) throw new Error('ML-DSA-65 signature is mathematically invalid')
+    const isValid = mlDsa.verify(signature, message, publicKey)
+    if (!isValid) throw new Error('ML-DSA signature is mathematically invalid')
 
-    log('algorithm', pkData.algorithm)
+    log('algorithm', token.algorithm)
     log('verified',  'via @noble/post-quantum directly (no SDK verify())')
     log('result',    'valid ✓')
-    pass('ML-DSA-65 signature verified independently — cryptography is correct')
-  } catch (err) { fail('independent ML-DSA-65 verification', err) }
+    pass('ML-DSA signature verified independently — cryptography is correct')
+  } catch (err) { fail('independent ML-DSA verification', err) }
 
   // ─── 14 Distinct signatures for identical payloads ───────────────────────────
   section('14 · Distinct signatures for identical payloads')
