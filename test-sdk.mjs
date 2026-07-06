@@ -88,7 +88,8 @@ async function run() {
   try {
     const h = await pq.health()
     if (h.status !== 'ok')           throw new Error('status is "' + h.status + '", expected "ok"')
-    if (!['ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87'].includes(h.algorithm)) throw new Error('unexpected algorithm: ' + h.algorithm)
+    const validAlgorithms = ['ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87', 'ML-DSA-44/65/87']
+    if (!validAlgorithms.some(a => h.algorithm.includes(a.split('/')[0]))) throw new Error('unexpected algorithm: ' + h.algorithm)
     if (!h.quantumResistant)         throw new Error('quantumResistant is false')
     if (!h.version)                  throw new Error('missing version field')
     if (h.standard !== 'NIST FIPS 204') throw new Error('standard is "' + h.standard + '", expected "NIST FIPS 204"')

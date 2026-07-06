@@ -480,7 +480,7 @@ export class PQAuth {
     const timer      = setTimeout(() => controller.abort(), this.timeout)
 
     try {
-      const res  = await fetch(`${this.baseUrl}/public-key`, { signal: controller.signal })
+      const res  = await fetch(`${this.baseUrl}/public-key`, { signal: controller.signal, headers: { 'X-API-Key': this.apiKey } })
       if (!res.ok) throw new PQAuthError(`Failed to fetch public key: ${res.status}`, 'NETWORK_ERROR', res.status)
       const data = await res.json() as { publicKey: string }
       if (!data.publicKey) throw new PQAuthError('Public key response missing publicKey field', 'NETWORK_ERROR')
