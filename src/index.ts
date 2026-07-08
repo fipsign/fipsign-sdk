@@ -156,6 +156,11 @@ export interface CaIssueCertResult {
     standard:  string
     format?:   string  // 'pqcert' | 'x509' — present for x509 CAs
     sizeNote?: string  // x509 only: size advisory
+    caExpiry?: {       // present only when expiresInSeconds was truncated to fit CA root lifetime
+      truncated:                  boolean
+      requestedExpiresInSeconds:  number
+      resolvedExpiresInSeconds:   number
+    }
   }
   usage: {
     freeRemaining:  number
@@ -329,6 +334,14 @@ function verifyCertLocally(cert: PQCert, rootCert: PQCert): void {
   }
 
   const now = Math.floor(Date.now() / 1000)
+
+  if (rootCert.expiresAt !== undefined && rootCert.expiresAt < now) {
+    throw new PQAuthError(
+      `Root CA certificate expired ${now - rootCert.expiresAt} seconds ago`,
+      'ROOT_CERT_EXPIRED'
+    )
+  }
+
   if (cert.expiresAt !== undefined && cert.expiresAt < now) {
     throw new PQAuthError(
       `Certificate expired ${now - cert.expiresAt} seconds ago`,
@@ -757,12 +770,19 @@ getCrl: async (): Promise<CaGetCrlResult> => {
           Certificate
         )
 
-        // ── Verificar expiración ────────────────────────────────────────────
+        // ── Verificar expiración del leaf ──────────────────────────────────
         const now      = new Date()
         const notAfter = cert.tbsCertificate.validity.notAfter.utcTime
           ?? cert.tbsCertificate.validity.notAfter.generalTime
         if (notAfter && notAfter < now) {
           return { valid: false, error: 'Certificate has expired' }
+        }
+
+        // ── Verificar vigencia del root CA ──────────────────────────────────
+        const rootNotAfter = root.tbsCertificate.validity.notAfter.utcTime
+          ?? root.tbsCertificate.validity.notAfter.generalTime
+        if (rootNotAfter && rootNotAfter < now) {
+          return { valid: false, error: 'Root CA certificate has expired' }
         }
 
         // ── Verificar algoritmo de firma ────────────────────────────────────────
