@@ -261,6 +261,11 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(binary)
 }
 
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 // ─── Local token verification ─────────────────────────────────────────────────
 
 function getMlDsa(algorithm: string) {
@@ -853,6 +858,53 @@ getCrl: async (): Promise<CaGetCrlResult> => {
           error: err instanceof Error ? err.message : 'Unknown error during X.509 verification',
         }
       }
+    },
+  }
+
+  // ── zes ──────────────────────────────────────────────────────────────────────
+
+  /**
+   * Zero-Exposure Signing — hash sensitive data locally and sign only the
+   * hash. The original data never reaches the API.
+   *
+   * Uses the standard sign()/verify() under the hood — this is a convenience
+   * wrapper, not a different endpoint. Revocation and everything else work
+   * exactly like any other token: use pqauth.revoke(token) directly, there
+   * is no zes.revoke().
+   *
+   * @example — sign
+   * const { token, hash } = await pqauth.zes.sign({ patient: 'Jane Doe', diagnosis: 'confidential' })
+   *
+   * @example — verify
+   * const { valid, dataMatches } = await pqauth.zes.verify(token, originalData)
+   * if (!valid || !dataMatches) return reject('invalid or tampered')
+   */
+  readonly zes = {
+
+    /**
+     * Hashes `data` locally with SHA-256 (keys sorted recursively for a
+     * deterministic hash regardless of key order) and signs only the hash.
+     * Costs 1 token, same as a regular sign() call.
+     */
+    sign: async (data: unknown, options?: { expiresInSeconds?: number }): Promise<SignResult & { hash: string }> => {
+      const hash   = await sha256Hex(canonicalizeForSigning(data))
+      const result = await this.sign({
+        sub: 'zes:' + hash,
+        zes: true,
+        ...(options?.expiresInSeconds !== undefined ? { expiresInSeconds: options.expiresInSeconds } : {}),
+      })
+      return { ...result, hash }
+    },
+
+    /**
+     * Re-hashes `data` locally and verifies the token, confirming the hash
+     * inside the token matches `data`. `data` is never sent to the API.
+     */
+    verify: async (token: PQToken, data: unknown): Promise<VerifyResult & { dataMatches: boolean }> => {
+      const hash        = await sha256Hex(canonicalizeForSigning(data))
+      const result      = await this.verify(token)
+      const dataMatches = result.valid && result.payload?.sub === 'zes:' + hash
+      return { ...result, dataMatches }
     },
   }
 
