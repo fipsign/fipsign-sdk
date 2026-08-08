@@ -931,6 +931,48 @@ async function run() {
     pass('ca.getCert() after revocation — status.revoked is true')
   } catch (err) { fail('ca.getCert() after revocation', err) }
 
+  // ─── 17 zes.sign() / zes.verify() ────────────────────────────────────────────
+  section('17 · zes.sign() / zes.verify()')
+  try {
+    const data = { patient: 'Jane Doe', diagnosis: 'confidential', record_id: 'MR-2026-4491' }
+
+    const r = await pq.zes.sign(data)
+    if (!r.token?.payload)    throw new Error('missing token.payload')
+    if (!r.hash)              throw new Error('missing hash')
+    if (r.hash.length !== 64) throw new Error('hash is ' + r.hash.length + ' chars, expected 64 (sha256 hex)')
+    const decodedSub = JSON.parse(atob(r.token.payload)).sub
+    if (decodedSub !== 'zes:' + r.hash) throw new Error('token sub is "' + decodedSub + '", expected "zes:' + r.hash + '"')
+    log('hash', r.hash)
+    log('sub',  decodedSub)
+    pass('zes.sign() — hashes data locally and signs zes:<hash>')
+
+    const v = await pq.zes.verify(r.token, data)
+    if (!v.valid)       throw new Error('valid is false')
+    if (!v.dataMatches) throw new Error('dataMatches should be true for original data')
+    log('valid',       String(v.valid))
+    log('dataMatches', String(v.dataMatches))
+    pass('zes.verify() — original data matches token hash')
+
+    const tamperedData = { ...data, diagnosis: 'tampered' }
+    const vTampered = await pq.zes.verify(r.token, tamperedData)
+    if (!vTampered.valid)      throw new Error('signature itself should still be cryptographically valid')
+    if (vTampered.dataMatches) throw new Error('dataMatches should be false for tampered data')
+    log('valid (tampered data)',       String(vTampered.valid))
+    log('dataMatches (tampered data)', String(vTampered.dataMatches))
+    pass('zes.verify() — tampered data correctly reported as not matching')
+
+    // Misma data lógica, distinto orden de keys — el hash debe ser idéntico
+    // (canonicalización recursiva y determinística, independiente del orden).
+    const reordered = { record_id: data.record_id, diagnosis: data.diagnosis, patient: data.patient }
+    const r2 = await pq.zes.sign(reordered)
+    if (r2.hash !== r.hash) throw new Error('hash differs for same data with reordered keys — canonicalization is not deterministic')
+    log('hash (reordered keys)', r2.hash)
+    pass('zes.sign() — deterministic hash regardless of key order')
+
+    await pq.revoke(r.token, 'zes integration test cleanup')
+    pass('revoke() on a zes token — works exactly like any other token, no zes-specific call needed')
+  } catch (err) { fail('zes.sign()/zes.verify()', err) }
+
   // ─── Summary ─────────────────────────────────────────────────────────────────
   const total = passed + failed
   console.log('\n' + '─'.repeat(48))
