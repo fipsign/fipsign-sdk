@@ -10,9 +10,10 @@
  *   FIPSIGN_ROOT_CERT_JSON="$(cat root-cert.json)"  — enables offline verifyCert() tests (PQCert CA)
  *   FIPSIGN_ROOT_CERT_PEM="$(cat root-cert.pem)"   — enables offline verifyX509Cert() tests (X.509 CA)
  *
- * Token cost: ~25 tokens per run.
+ * Token cost: ~29 tokens per run.
  *   Includes 2 expiry tests that sign a token with expiresInSeconds:60 and wait 62 seconds each.
  *   All other tests use standard 1-hour tokens. Total runtime: ~3-4 minutes.
+ *   Mandate section (18): 1 emit + 3 granted verify() calls = 4 tokens (PATCH/GET/LIST are free).
  *
  * Prerequisites:
  *   1. Create a free account at https://app.fipsign.dev
@@ -972,6 +973,190 @@ async function run() {
     await pq.revoke(r.token, 'zes integration test cleanup')
     pass('revoke() on a zes token — works exactly like any other token, no zes-specific call needed')
   } catch (err) { fail('zes.sign()/zes.verify()', err) }
+
+  section('18 · Mandate')
+
+  let mandateId, mandateToken
+
+  // 18.1 mandate.emit()
+  try {
+    const r = await pq.mandate.emit({
+      agentId:          'agent_test_' + Date.now(),
+      issuedBy:         'sdk_integration_test',
+      scope:            ['read_tickets', 'send_reply'],
+      budgetTotal:      3,
+      expiresInSeconds: 3600,
+    })
+    if (!r.mandate.id)                 throw new Error('missing mandate.id')
+    if (!r.mandate.token?.payload)     throw new Error('missing mandate.token.payload')
+    if (!r.mandate.token?.signature)   throw new Error('missing mandate.token.signature')
+    if (r.mandate.status !== 'active') throw new Error('status is "' + r.mandate.status + '", expected "active"')
+    if (r.mandate.budgetTotal !== 3)   throw new Error('budgetTotal is ' + r.mandate.budgetTotal + ', expected 3')
+    if (JSON.stringify(r.mandate.scope) !== JSON.stringify(['read_tickets', 'send_reply']))
+      throw new Error('scope is ' + JSON.stringify(r.mandate.scope))
+    if (typeof r.usage.freeRemaining !== 'number') throw new Error('missing usage.freeRemaining')
+    mandateId    = r.mandate.id
+    mandateToken = r.mandate.token
+    log('id',     mandateId)
+    log('status', r.mandate.status)
+    log('scope',  r.mandate.scope.join(', '))
+    pass('mandate.emit() — mandate created with correct fields')
+  } catch (err) { fail('mandate.emit()', err) }
+
+  // 18.2 mandate.verify() — granted, in-scope action
+  try {
+    if (!mandateId) throw new Error('skipped — mandate.emit() failed')
+    const v = await pq.mandate.verify(mandateToken, 'read_tickets', 1)
+    if (v.result !== 'granted') throw new Error('result is "' + v.result + '", expected "granted" (reason: ' + v.reason + ')')
+    if (v.actionMatched !== 'read_tickets') throw new Error('actionMatched is "' + v.actionMatched + '"')
+    if (v.budgetRemaining !== 2) throw new Error('budgetRemaining is ' + v.budgetRemaining + ', expected 2')
+    log('result',          v.result)
+    log('budgetRemaining', String(v.budgetRemaining))
+    pass('mandate.verify() — in-scope action granted, budget decremented correctly')
+  } catch (err) { fail('mandate.verify() — granted', err) }
+
+  // 18.3 mandate.verify() — denied, out-of-scope action (must NOT consume budget)
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const v = await pq.mandate.verify(mandateToken, 'delete_everything', 1)
+    if (v.result !== 'denied') throw new Error('result is "' + v.result + '", expected "denied"')
+    if (v.reason !== 'scope_not_authorized') throw new Error('reason is "' + v.reason + '", expected "scope_not_authorized"')
+    if (!v.authorizedScope) throw new Error('missing authorizedScope on denial')
+    log('reason',          v.reason)
+    log('authorizedScope', v.authorizedScope.join(', '))
+    pass('mandate.verify() — out-of-scope action denied with reason and authorizedScope')
+  } catch (err) { fail('mandate.verify() — denied (scope)', err) }
+
+  // 18.4 mandate.get() — budgetConsumed reflects ONLY the granted call, scope untouched
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const g = await pq.mandate.get(mandateId)
+    if (g.mandate.budgetConsumed !== 1)
+      throw new Error('budgetConsumed is ' + g.mandate.budgetConsumed + ', expected 1 — a denied verify() must never consume budget')
+    if (g.mandate.budgetRemaining !== 2) throw new Error('budgetRemaining is ' + g.mandate.budgetRemaining + ', expected 2')
+    if (JSON.stringify(g.mandate.scopeCurrent) !== JSON.stringify(['read_tickets', 'send_reply']))
+      throw new Error('scopeCurrent should be unchanged before narrow()')
+    log('budgetConsumed', String(g.mandate.budgetConsumed))
+    log('status',         g.mandate.status)
+    pass('mandate.get() — state reflects only the granted verify(), denial did not consume budget')
+  } catch (err) { fail('mandate.get()', err) }
+
+  // 18.5 mandate.list() — mandate appears in the project's list
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const l = await pq.mandate.list()
+    const found = l.mandates.find(m => m.id === mandateId)
+    if (!found) throw new Error('mandate ' + mandateId + ' not found in list() (total: ' + l.total + ')')
+    log('total', String(l.total))
+    pass('mandate.list() — created mandate appears in the project list')
+  } catch (err) { fail('mandate.list()', err) }
+
+  // 18.6 mandate.narrow() — shrink scope, confirm the removed action is now denied
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const p = await pq.mandate.narrow(mandateId, ['read_tickets'])
+    if (JSON.stringify(p.scope) !== JSON.stringify(['read_tickets']))
+      throw new Error('scope after narrow is ' + JSON.stringify(p.scope) + ', expected ["read_tickets"]')
+    log('scope after narrow', p.scope.join(', '))
+    pass('mandate.narrow() — scope correctly reduced')
+
+    const vRemoved = await pq.mandate.verify(mandateToken, 'send_reply', 1)
+    if (vRemoved.result !== 'denied') throw new Error('send_reply should be denied after narrow, got "' + vRemoved.result + '"')
+    if (vRemoved.reason !== 'scope_not_authorized') throw new Error('reason is "' + vRemoved.reason + '"')
+    pass('mandate.verify() — action removed by narrow() is correctly denied')
+  } catch (err) { fail('mandate.narrow()', err) }
+
+  // 18.7 Budget exhaustion — 2 remaining, cost=1 each, 3rd consuming call denied
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const v1 = await pq.mandate.verify(mandateToken, 'read_tickets', 1)
+    if (v1.result !== 'granted' || v1.budgetRemaining !== 1)
+      throw new Error('unexpected state after 1st consuming call: ' + JSON.stringify(v1))
+    const v2 = await pq.mandate.verify(mandateToken, 'read_tickets', 1)
+    if (v2.result !== 'granted' || v2.budgetRemaining !== 0)
+      throw new Error('unexpected state after 2nd consuming call: ' + JSON.stringify(v2))
+    const v3 = await pq.mandate.verify(mandateToken, 'read_tickets', 1)
+    if (v3.result !== 'denied') throw new Error('3rd call should be denied — budget exhausted, got "' + v3.result + '"')
+    if (v3.reason !== 'budget_exhausted') throw new Error('reason is "' + v3.reason + '", expected "budget_exhausted"')
+    if (v3.budgetConsumedUnits !== 3 || v3.budgetTotalUnits !== 3)
+      throw new Error('budgetConsumedUnits/budgetTotalUnits mismatch: ' + JSON.stringify(v3))
+    log('budgetConsumedUnits', String(v3.budgetConsumedUnits))
+    log('budgetTotalUnits',    String(v3.budgetTotalUnits))
+    pass('mandate.verify() — budget correctly exhausted after 3 granted calls, 4th denied')
+  } catch (err) { fail('mandate — budget exhaustion', err) }
+
+  // 18.8 mandate.suspend() → verify() denied specifically for suspension (checked before budget on the backend)
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const p = await pq.mandate.suspend(mandateId)
+    if (p.status !== 'suspended') throw new Error('status is "' + p.status + '", expected "suspended"')
+    pass('mandate.suspend() — status set to suspended')
+
+    const v = await pq.mandate.verify(mandateToken, 'read_tickets', 1)
+    if (v.result !== 'denied') throw new Error('verify should be denied while suspended')
+    if (v.reason !== 'mandate_suspended')
+      throw new Error('reason is "' + v.reason + '", expected "mandate_suspended" — suspension must be checked before budget')
+    log('reason', v.reason)
+    pass('mandate.verify() — denied for suspension even with budget already exhausted (confirms check order)')
+  } catch (err) { fail('mandate.suspend()', err) }
+
+  // 18.9 mandate.suspend() — idempotent on an already-suspended mandate
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const p = await pq.mandate.suspend(mandateId)
+    if (p.status !== 'suspended') throw new Error('status is "' + p.status + '", expected "suspended"')
+    if (p.message !== 'Already suspended') throw new Error('missing/unexpected message: "' + p.message + '"')
+    log('message', p.message)
+    pass('mandate.suspend() — idempotent, second call reports "Already suspended"')
+  } catch (err) { fail('mandate.suspend() — idempotent', err) }
+
+  // 18.10 mandate.resume()
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const p = await pq.mandate.resume(mandateId)
+    if (p.status !== 'active') throw new Error('status is "' + p.status + '", expected "active"')
+    pass('mandate.resume() — status set back to active')
+  } catch (err) { fail('mandate.resume()', err) }
+
+  // 18.11 mandate.revoke() → verify() denied specifically for revocation
+  try {
+    if (!mandateId) throw new Error('skipped')
+    const p = await pq.mandate.revoke(mandateId)
+    if (p.status !== 'revoked') throw new Error('status is "' + p.status + '", expected "revoked"')
+    pass('mandate.revoke() — status set to revoked')
+
+    const v = await pq.mandate.verify(mandateToken, 'read_tickets', 1)
+    if (v.result !== 'denied') throw new Error('verify should be denied after revoke')
+    if (v.reason !== 'mandate_revoked') throw new Error('reason is "' + v.reason + '", expected "mandate_revoked"')
+    log('reason', v.reason)
+    pass('mandate.verify() — denied after revoke()')
+  } catch (err) { fail('mandate.revoke()', err) }
+
+  // 18.12 mandate.narrow() on a revoked mandate — revoke is irreversible, must reject
+  try {
+    if (!mandateId) throw new Error('skipped')
+    try {
+      await pq.mandate.narrow(mandateId, ['read_tickets'])
+      throw new Error('narrow() should have thrown for a revoked mandate, but succeeded')
+    } catch (err) {
+      if (!(err instanceof PQAuthError)) throw err
+      log('error', err.message)
+      pass('mandate.narrow() — correctly rejected on a revoked (irreversible) mandate')
+    }
+  } catch (err) { fail('mandate.narrow() on revoked', err) }
+
+  // 18.13 Regression test — invalid API key must surface a real reason, not undefined
+  // (this is exactly the gap found and fixed while building mandate.verify(): generic
+  // backend failures like an invalid API key don't carry a `result` field, and must be
+  // normalized into { result: 'denied', reason } instead of silently dropping the message)
+  try {
+    const badPq = new PQAuth('pqa_' + '0'.repeat(64))
+    const v = await badPq.mandate.verify(mandateToken, 'read_tickets', 1)
+    if (v.result !== 'denied') throw new Error('expected "denied" for an invalid API key, got "' + v.result + '"')
+    if (!v.reason) throw new Error('reason is missing/undefined — the generic-failure normalization regressed')
+    log('reason', v.reason)
+    pass('mandate.verify() — invalid API key surfaces a real reason, not undefined (regression test)')
+  } catch (err) { fail('mandate.verify() — invalid API key', err) }
 
   // ─── Summary ─────────────────────────────────────────────────────────────────
   const total = passed + failed

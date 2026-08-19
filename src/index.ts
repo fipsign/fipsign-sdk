@@ -220,6 +220,88 @@ export interface VerifyCertResult {
   error?: string
 }
 
+// ─── Mandate types ────────────────────────────────────────────────────────────
+
+export type MandateStatus = 'active' | 'suspended' | 'revoked'
+
+export interface Mandate {
+  id:               string
+  agentId:          string
+  issuedBy:         string
+  scopeOriginal:    string[]
+  scopeCurrent:     string[]
+  budgetTotal:      number
+  budgetConsumed:   number
+  budgetRemaining:  number
+  status:           MandateStatus
+  issuedAt:         number
+  expiresAt:        number
+  expiresInSeconds: number
+  updatedAt:        number
+}
+
+export interface MandateEmitOptions {
+  agentId:          string
+  issuedBy:         string
+  scope:            string[]
+  budgetTotal:      number
+  expiresInSeconds: number
+}
+
+export interface MandateEmitResult {
+  mandate: {
+    id:          string
+    agentId:     string
+    issuedBy:    string
+    scope:       string[]
+    budgetTotal: number
+    expiresAt:   number
+    status:      MandateStatus
+    token:       PQToken
+  }
+  usage: {
+    freeRemaining:  number
+    packRemaining:  number
+    totalRemaining: number
+    month:          string
+  }
+}
+
+export interface MandateVerifyResult {
+  result:               'granted' | 'denied'
+  reason?:              string
+  actionMatched?:       string
+  budgetRemaining?:     number
+  expiresInSeconds?:    number
+  authorizedScope?:     string[]
+  budgetConsumedUnits?: number
+  budgetTotalUnits?:    number
+  usage?: {
+    freeRemaining:  number
+    packRemaining:  number
+    totalRemaining: number
+    month:          string
+  }
+}
+
+export interface MandatePatchResult {
+  id:         string
+  status:     MandateStatus
+  scope?:     string[]
+  updatedAt?: number
+  /** Only present when suspend() is called on an already-suspended mandate. */
+  message?:   string
+}
+
+export interface MandateGetResult {
+  mandate: Mandate
+}
+
+export interface MandateListResult {
+  mandates: Mandate[]
+  total:    number
+}
+
 // ─── Middleware types ─────────────────────────────────────────────────────────
 
 export interface MiddlewareRequest {
@@ -859,6 +941,146 @@ getCrl: async (): Promise<CaGetCrlResult> => {
         }
       }
     },
+  }
+
+  // ── mandate ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Mandate — bounded, revocable authorization for AI agents and automated
+   * services. A mandate defines what an agent can do (scope), for how long,
+   * and under what usage limit (budget) — signed with ML-DSA so the agent
+   * can carry proof of its own authorization.
+   *
+   * REST-only on the backend today — this namespace is a thin typed wrapper
+   * over POST/PATCH/GET /mandate, same shape as `ca` above.
+   *
+   * @example — emit a mandate for an agent
+   * const { mandate } = await pqauth.mandate.emit({
+   *   agentId:          'agent_support_bot',
+   *   issuedBy:         'user_42',
+   *   scope:            ['read_tickets', 'send_reply'],
+   *   budgetTotal:      100,
+   *   expiresInSeconds: 3600,
+   * })
+   *
+   * @example — check authorization before the agent acts
+   * const check = await pqauth.mandate.verify(mandate.token, 'send_reply', 1)
+   * if (check.result !== 'granted') return reject(check.reason)
+   *
+   * @example — narrow, suspend, resume, revoke
+   * await pqauth.mandate.narrow(mandate.id, ['read_tickets'])
+   * await pqauth.mandate.suspend(mandate.id)
+   * await pqauth.mandate.resume(mandate.id)
+   * await pqauth.mandate.revoke(mandate.id)
+   */
+  readonly mandate = {
+
+    /**
+     * Emit a new mandate. Costs 1 token.
+     *
+     * `budgetTotal: 0` means unlimited budget — the rejection check is
+     * skipped, but budgetConsumed still accumulates.
+     */
+    emit: (options: MandateEmitOptions): Promise<MandateEmitResult> =>
+      this.request<MandateEmitResult>('/mandate', {
+        method: 'POST',
+        body:   JSON.stringify(options),
+      }),
+
+    /**
+     * Verify a mandate token and check whether `action` is authorized
+     * right now — signature, expiry, status, scope, and remaining budget,
+     * all in one atomic server-side check.
+     *
+     * Never throws — returns { result: 'denied', reason } on any failure
+     * (invalid signature, expired, suspended, revoked, action not in
+     * scope, or budget exhausted). Only billed 1 token when the result is
+     * 'granted' — a denied check is always free.
+     *
+     * Unlike pqauth.verify(), there is no local/offline mode here: budget
+     * and scope are live mutable state that can only be checked against
+     * the server, not the signature alone.
+     *
+     * @example
+     * const check = await pqauth.mandate.verify(token, 'send_email', 1)
+     * if (check.result !== 'granted') return reject(check.reason)
+     */
+    verify: async (token: PQToken, action: string, cost: number): Promise<MandateVerifyResult> => {
+      const controller = new AbortController()
+      const timer      = setTimeout(() => controller.abort(), this.timeout)
+      try {
+        const res = await fetch(`${this.baseUrl}/mandate/verify`, {
+          method:  'POST',
+          signal:  controller.signal,
+          headers: { 'Content-Type': 'application/json', 'X-API-Key': this.apiKey },
+          body:    JSON.stringify({ token, action, cost }),
+        })
+        // Deliberately NOT using this.request() here: a 'denied' result is
+        // a normal, expected outcome carrying real data (reason,
+        // authorizedScope, budgetConsumedUnits, budgetTotalUnits) in a
+        // 403 response — not an error to discard. request() only forwards
+        // a generic `error` field on failure, which this endpoint doesn't
+        // use, so those fields would be lost if we let it throw.
+        const data = await res.json() as MandateVerifyResult & { success?: boolean; error?: string }
+        if (data.result === 'granted' || data.result === 'denied') return data
+        // Failures that never reach mandate-specific logic (invalid/missing
+        // API key, rate limit, malformed body) come back through the
+        // generic errorResponse() shape — { success:false, error } — with
+        // no `result` field at all. Normalize those into the same denied
+        // shape instead of silently dropping the real error message.
+        return { result: 'denied', reason: data.error ?? `Request failed with status ${res.status}` }
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          return { result: 'denied', reason: 'Request timed out' }
+        }
+        return {
+          result: 'denied',
+          reason: `Network error: ${err instanceof Error ? err.message : 'unknown'}`,
+        }
+      } finally {
+        clearTimeout(timer)
+      }
+    },
+
+    /**
+     * Permanently shrink a mandate's scope to a subset of its current
+     * scope. Monotonic — cannot be reversed, and cannot re-widen toward
+     * the original scope. To restore scope, emit a new mandate.
+     */
+    narrow: (mandateId: string, scope: string[]): Promise<MandatePatchResult> =>
+      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+        method: 'PATCH',
+        body:   JSON.stringify({ action: 'narrow', scope }),
+      }),
+
+    /** Temporarily pause a mandate. verify() will deny while suspended. */
+    suspend: (mandateId: string): Promise<MandatePatchResult> =>
+      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+        method: 'PATCH',
+        body:   JSON.stringify({ action: 'suspend' }),
+      }),
+
+    /** Reactivate a suspended mandate. */
+    resume: (mandateId: string): Promise<MandatePatchResult> =>
+      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+        method: 'PATCH',
+        body:   JSON.stringify({ action: 'resume' }),
+      }),
+
+    /** Permanently terminate a mandate. Irreversible. */
+    revoke: (mandateId: string): Promise<MandatePatchResult> =>
+      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+        method: 'PATCH',
+        body:   JSON.stringify({ action: 'revoke' }),
+      }),
+
+    /** Get a mandate's current state by id. Free — no token cost. */
+    get: (mandateId: string): Promise<MandateGetResult> =>
+      this.request<MandateGetResult>(`/mandate/${mandateId}`),
+
+    /** List all mandates for this project. Free — no token cost. */
+    list: (): Promise<MandateListResult> =>
+      this.request<MandateListResult>('/mandate'),
   }
 
   // ── zes ──────────────────────────────────────────────────────────────────────
