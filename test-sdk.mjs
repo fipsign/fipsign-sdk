@@ -2,6 +2,9 @@
  * FIPSign SDK — Integration test
  * Runs against the live backend using the published fipsign-sdk
  *
+ * Optional: FIPSIGN_BASE_URL (default https://api.fipsign.dev) runs the suite against another
+ *   deployment, for example a local "wrangler dev" at http://localhost:8787.
+ *
  * Usage:
  *   FIPSIGN_API_KEY=pqa_... \
  *   node test-sdk.mjs
@@ -13,7 +16,9 @@
  * Token cost: ~29 tokens per run.
  *   Includes 2 expiry tests that sign a token with expiresInSeconds:60 and wait 62 seconds each.
  *   All other tests use standard 1-hour tokens. Total runtime: ~3-4 minutes.
- *   Mandate section (18): 1 emit + 3 granted verify() calls = 4 tokens (PATCH/GET/LIST are free).
+ *   Mandate section (18), on top of the ~29 above: 4 emits + 6 granted verify() calls. Emit and verify
+ *   are priced by the platform (2 tokens each today, see the guide), so 20 tokens; PATCH/GET/LIST and
+ *   denied verify() calls are free. Section 19: 1 sign() = 1 token.
  *
  * Prerequisites:
  *   1. Create a free account at https://app.fipsign.dev
@@ -23,12 +28,13 @@
  */
 
 import { createHmac } from 'crypto'
-import { PQAuth, PQAuthError } from 'fipsign-sdk'
+import { PQAuth, PQAuthError, generateKeyPair, generateAgentKeyPair, signAgentCall } from 'fipsign-sdk'
 import { ml_dsa44, ml_dsa65, ml_dsa87 } from '@noble/post-quantum/ml-dsa.js'
 
 // ─── Required environment variables ───────────────────────────────────────────
 
 const API_KEY            = process.env.FIPSIGN_API_KEY
+const BASE_URL           = process.env.FIPSIGN_BASE_URL   // optional, default https://api.fipsign.dev
 
 if (!API_KEY) {
   console.error('\x1b[31mError: FIPSIGN_API_KEY is required.\x1b[0m')
@@ -69,6 +75,12 @@ function section(title) {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+// Options shared by every PQAuth instance of this run (API key + optional base URL).
+function clientOptions(extra = {}) {
+  return { apiKey: API_KEY, ...(BASE_URL ? { baseUrl: BASE_URL } : {}), ...extra }
+}
+const API_BASE = BASE_URL ? BASE_URL.replace(/\/+$/, '') : 'https://api.fipsign.dev'
+
 function fromBase64(b64) {
   const binary = atob(b64)
   const bytes  = new Uint8Array(binary.length)
@@ -82,7 +94,7 @@ async function run() {
   console.log('\n' + BOLD + 'FIPSign SDK — Integration Test' + RESET)
   console.log(DIM + 'fipsign-sdk · ' + new Date().toISOString() + RESET + '\n')
 
-  const pq = new PQAuth(API_KEY)
+  const pq = new PQAuth(clientOptions())
 
   // ─── 01 Health check ────────────────────────────────────────────────────────
   section('01 · Health check')
@@ -299,7 +311,7 @@ async function run() {
   // ─── 05 verify() local ──────────────────────────────────────────────────────
   section('05 · verify() — local (offline)')
 
-  const pqLocal = new PQAuth({ apiKey: API_KEY, localVerify: true, projectId: userProjectId })
+  const pqLocal = new PQAuth(clientOptions({ localVerify: true, projectId: userProjectId }))
 
   try {
     await pqLocal.preloadPublicKey()
@@ -328,7 +340,7 @@ async function run() {
       pass('verify() local — tampered token rejected in-memory')
     } catch (err) { fail('verify() local — tampered token', err) }
     try {
-      const wrongProjectClient = new PQAuth({ apiKey: API_KEY, localVerify: true, projectId: 'proj_wrong_for_test' })
+      const wrongProjectClient = new PQAuth(clientOptions({ localVerify: true, projectId: 'proj_wrong_for_test' }))
       const r = await wrongProjectClient.verify(userToken)
       if (r.valid) throw new Error('expected valid:false for token from a different project')
       // No verificamos el mensaje exacto — debe ser indistinguible de INVALID_SIGNATURE
@@ -501,7 +513,7 @@ async function run() {
   // ─── 13 Independent ML-DSA signature verification ───────────────────────────
   section('13 · Independent ML-DSA signature verification (44/65/87)')
   try {
-    const pkResp = await fetch('https://api.fipsign.dev/public-key', {
+    const pkResp = await fetch(API_BASE + '/public-key', {
       headers: { 'X-API-Key': API_KEY }
     })
     const pkData = await pkResp.json()
@@ -1046,8 +1058,8 @@ async function run() {
     if (!mandateId) throw new Error('skipped')
     const l = await pq.mandate.list()
     const found = l.mandates.find(m => m.id === mandateId)
-    if (!found) throw new Error('mandate ' + mandateId + ' not found in list() (total: ' + l.total + ')')
-    log('total', String(l.total))
+    if (!found) throw new Error('mandate ' + mandateId + ' not found in the first page of list() (count: ' + l.count + ')')
+    log('count', String(l.count))
     pass('mandate.list() — created mandate appears in the project list')
   } catch (err) { fail('mandate.list()', err) }
 
@@ -1150,13 +1162,287 @@ async function run() {
   // backend failures like an invalid API key don't carry a `result` field, and must be
   // normalized into { result: 'denied', reason } instead of silently dropping the message)
   try {
-    const badPq = new PQAuth('pqa_' + '0'.repeat(64))
+    const badPq = new PQAuth(clientOptions({ apiKey: 'pqa_' + '0'.repeat(64) }))
     const v = await badPq.mandate.verify(mandateToken, 'read_tickets', 1)
     if (v.result !== 'denied') throw new Error('expected "denied" for an invalid API key, got "' + v.result + '"')
     if (!v.reason) throw new Error('reason is missing/undefined — the generic-failure normalization regressed')
     log('reason', v.reason)
     pass('mandate.verify() — invalid API key surfaces a real reason, not undefined (regression test)')
   } catch (err) { fail('mandate.verify() — invalid API key', err) }
+
+  // 18.14 mandate.get() — the id is URL-encoded, never interpreted as a path
+  try {
+    try {
+      await pq.mandate.get('../usage')
+      throw new Error('get("../usage") succeeded: the id was used as a path and reached another endpoint')
+    } catch (err) {
+      if (!(err instanceof PQAuthError)) throw err
+      if (err.status !== 404) throw new Error('status is ' + err.status + ', expected 404')
+      log('status', String(err.status))
+      pass('mandate.get() — a path-like id is URL-encoded and answered 404')
+    }
+  } catch (err) { fail('mandate.get() — id encoding', err) }
+
+  // 18.15 mandate.list({ limit, cursor }) — page shape and cursor
+  try {
+    const first = await pq.mandate.list({ limit: 1 })
+    if (first.mandates.length > 1) throw new Error('limit=1 returned ' + first.mandates.length + ' mandates')
+    if (first.count !== first.mandates.length) throw new Error('count is ' + first.count + ' but the page holds ' + first.mandates.length)
+    if ('total' in first) throw new Error('unexpected "total" field: it was replaced by count and nextCursor')
+    if (first.nextCursor !== null && typeof first.nextCursor !== 'string') throw new Error('nextCursor must be a string or null')
+    log('page 1',     first.mandates.map(m => m.id).join(', ') || '(empty)')
+    log('nextCursor', first.nextCursor === null ? 'null (last page)' : 'present')
+    if (first.nextCursor !== null) {
+      const second   = await pq.mandate.list({ limit: 1, cursor: first.nextCursor })
+      const firstIds = first.mandates.map(m => m.id)
+      if (second.mandates.length > 1) throw new Error('page 2 with limit=1 returned ' + second.mandates.length + ' mandates')
+      if (second.mandates.some(m => firstIds.includes(m.id))) throw new Error('page 2 repeats a mandate from page 1')
+    }
+    pass('mandate.list({ limit, cursor }) — page shape, count and cursor')
+  } catch (err) { fail('mandate.list() — pagination', err) }
+
+  // 18.16 mandate.list() — an invalid limit or cursor is a 400
+  try {
+    for (const [name, options] of [['limit 0', { limit: 0 }], ['cursor "not-a-cursor"', { cursor: 'not-a-cursor' }]]) {
+      try {
+        await pq.mandate.list(options)
+        throw new Error(name + ' should have been rejected')
+      } catch (err) {
+        if (!(err instanceof PQAuthError)) throw err
+        if (err.status !== 400) throw new Error(name + ': status is ' + err.status + ', expected 400')
+        log(name, err.message)
+      }
+    }
+    pass('mandate.list() — invalid limit and invalid cursor rejected with 400')
+  } catch (err) { fail('mandate.list() — invalid parameters', err) }
+
+  // 18.17 Proof of possession — emit with the agent's public key (the private key stays here, with the "agent")
+  let popId, popToken, agentKeys
+  try {
+    agentKeys = await generateAgentKeyPair()
+    if (agentKeys.algorithm !== 'ML-DSA-65') throw new Error('the default algorithm is ' + agentKeys.algorithm + ', expected ML-DSA-65')
+    const r = await pq.mandate.emit({
+      agentId:          'agent_pop_' + Date.now(),
+      issuedBy:         'sdk_integration_test',
+      scope:            ['read_tickets'],
+      budgetTotal:      5,
+      expiresInSeconds: 3600,
+      agentPublicKey:   agentKeys.publicKey,
+    })
+    if (r.mandate.requiresAgentSignature !== true) throw new Error('requiresAgentSignature is ' + r.mandate.requiresAgentSignature + ', expected true')
+    popId    = r.mandate.id
+    popToken = r.mandate.token
+    log('id', popId)
+    pass('mandate.emit({ agentPublicKey }) — the mandate requires the agent signature')
+  } catch (err) { fail('mandate.emit() — proof of possession', err) }
+
+  // 18.18 verify without the agent's signature is denied (and free)
+  try {
+    if (!popId) throw new Error('skipped — the PoP mandate was not created')
+    const v = await pq.mandate.verify(popToken, 'read_tickets', 1)
+    if (v.result !== 'denied') throw new Error('result is "' + v.result + '", expected "denied"')
+    if (v.reason !== 'agent_signature_required') throw new Error('reason is "' + v.reason + '", expected "agent_signature_required"')
+    log('reason', v.reason)
+    pass('mandate.verify() — denied without the agent signature')
+  } catch (err) { fail('mandate.verify() — PoP, no signature', err) }
+
+  // 18.19 verify with the signature made by signAgentCall() is granted (it accepts the mandate token)
+  let popSignature
+  try {
+    if (!popId) throw new Error('skipped')
+    popSignature = await signAgentCall({ mandate: popToken, action: 'read_tickets', cost: 1, secretKey: agentKeys.secretKey })
+    const v = await pq.mandate.verify(popToken, 'read_tickets', 1, { agentSignature: popSignature })
+    if (v.result !== 'granted') throw new Error('result is "' + v.result + '", expected "granted" (reason: ' + v.reason + ')')
+    if (v.budgetRemaining !== 4) throw new Error('budgetRemaining is ' + v.budgetRemaining + ', expected 4')
+    log('budgetRemaining', String(v.budgetRemaining))
+    pass('mandate.verify({ agentSignature }) — granted with a signature from signAgentCall()')
+  } catch (err) { fail('mandate.verify() — PoP, with signature', err) }
+
+  // 18.20 the same signature cannot be used twice
+  try {
+    if (!popSignature) throw new Error('skipped')
+    const v = await pq.mandate.verify(popToken, 'read_tickets', 1, { agentSignature: popSignature })
+    if (v.result !== 'denied') throw new Error('result is "' + v.result + '", expected "denied"')
+    if (v.reason !== 'agent_signature_replayed') throw new Error('reason is "' + v.reason + '", expected "agent_signature_replayed"')
+    log('reason', v.reason)
+    pass('mandate.verify() — the same agent signature is rejected the second time')
+  } catch (err) { fail('mandate.verify() — PoP, replay', err) }
+
+  // 18.21 a signature made for another cost is a mismatch
+  try {
+    if (!popId) throw new Error('skipped')
+    const sig = await signAgentCall({ mandate: popId, action: 'read_tickets', cost: 2, secretKey: agentKeys.secretKey })
+    const v = await pq.mandate.verify(popToken, 'read_tickets', 1, { agentSignature: sig })
+    if (v.result !== 'denied') throw new Error('result is "' + v.result + '", expected "denied"')
+    if (v.reason !== 'agent_signature_mismatch') throw new Error('reason is "' + v.reason + '", expected "agent_signature_mismatch"')
+    log('reason', v.reason)
+    pass('mandate.verify() — a signature made for another cost is denied')
+  } catch (err) { fail('mandate.verify() — PoP, cost mismatch', err) }
+
+  // 18.22 mandate.get() tells which mandates need the agent signature
+  try {
+    if (!popId || !mandateId) throw new Error('skipped')
+    const withKey    = await pq.mandate.get(popId)
+    const withoutKey = await pq.mandate.get(mandateId)
+    if (withKey.mandate.requiresAgentSignature !== true) throw new Error('PoP mandate: requiresAgentSignature is ' + withKey.mandate.requiresAgentSignature)
+    if (withoutKey.mandate.requiresAgentSignature !== false) throw new Error('plain mandate: requiresAgentSignature is ' + withoutKey.mandate.requiresAgentSignature)
+    pass('mandate.get() — requiresAgentSignature is true with agentPublicKey, false without')
+  } catch (err) { fail('mandate.get() — requiresAgentSignature', err) }
+
+  // 18.23 signAgentCall() — id or token give the same subject; bad arguments fail locally
+  try {
+    if (!popId) throw new Error('skipped')
+    const decode    = t => JSON.parse(new TextDecoder().decode(fromBase64(t.payload)))
+    const fromId    = decode(await signAgentCall({ mandate: popId,    action: ' read_tickets ', cost: 1, secretKey: agentKeys.secretKey }))
+    const fromToken = decode(await signAgentCall({ mandate: popToken, action: 'read_tickets',   cost: 1, secretKey: agentKeys.secretKey }))
+    if (fromId.sub !== popId || fromToken.sub !== popId) throw new Error('sub is "' + fromId.sub + '" / "' + fromToken.sub + '", expected ' + popId)
+    if (fromId.action !== 'read_tickets') throw new Error('the action was not trimmed: "' + fromId.action + '"')
+    if (!(fromId.exp > fromId.iat)) throw new Error('exp must be after iat')
+    const bad = [
+      ['cost -1',               { cost: -1 },                       'INVALID_ARGUMENT'],
+      ['cost 1.5',              { cost: 1.5 },                      'INVALID_ARGUMENT'],
+      ['blank action',          { action: '   ' },                  'INVALID_ARGUMENT'],
+      ['expiresInSeconds 0',    { expiresInSeconds: 0 },            'INVALID_ARGUMENT'],
+      ['wrong algorithm',       { algorithm: 'ML-DSA-44' },         'INVALID_SECRET_KEY'],
+      ['secretKey not base64',  { secretKey: 'not base64 !!!' },    'INVALID_SECRET_KEY'],
+    ]
+    for (const [name, override, code] of bad) {
+      let caught = null
+      try { await signAgentCall({ mandate: popId, action: 'read_tickets', cost: 1, secretKey: agentKeys.secretKey, ...override }) } catch (err) { caught = err }
+      if (!(caught instanceof PQAuthError)) throw new Error(name + ': expected a PQAuthError, got ' + caught)
+      if (caught.code !== code) throw new Error(name + ': code is "' + caught.code + '", expected "' + code + '"')
+    }
+    log('checked', bad.map(b => b[0]).join(', '))
+    pass('signAgentCall() — id or token give the same subject; invalid arguments are rejected locally')
+  } catch (err) { fail('signAgentCall()', err) }
+
+  // 18.24 mandate.listAll() — follows nextCursor across pages (limit 1) and stops cleanly
+  try {
+    if (!popId || !mandateId) throw new Error('skipped')
+    const ids = []
+    for await (const m of pq.mandate.listAll({ limit: 1 })) {
+      ids.push(m.id)
+      if ((ids.includes(popId) && ids.includes(mandateId)) || ids.length >= 50) break
+    }
+    if (!ids.includes(popId) || !ids.includes(mandateId)) throw new Error('listAll() did not reach both mandates of this run in ' + ids.length + ' items')
+    if (new Set(ids).size !== ids.length) throw new Error('listAll() returned a mandate twice')
+    log('items read', String(ids.length))
+    pass('mandate.listAll() — iterates page by page and can be stopped with break')
+  } catch (err) { fail('mandate.listAll()', err) }
+
+  // 18.25 revoke the PoP mandate (cleanup)
+  try {
+    if (!popId) throw new Error('skipped')
+    const p = await pq.mandate.revoke(popId)
+    if (p.status !== 'revoked') throw new Error('status is "' + p.status + '", expected "revoked"')
+    pass('mandate.revoke() — PoP mandate revoked')
+  } catch (err) { fail('mandate.revoke() — PoP mandate', err) }
+
+  // 18.26 generateAgentKeyPair() — the three variants, their sizes, the default and invalid names (local, free)
+  try {
+    const sizes = { 'ML-DSA-44': [1312, 2560], 'ML-DSA-65': [1952, 4032], 'ML-DSA-87': [2592, 4896] }
+    for (const [alg, [pub, sec]] of Object.entries(sizes)) {
+      const k = await generateAgentKeyPair({ algorithm: alg })
+      if (k.algorithm !== alg) throw new Error(alg + ': the algorithm field is ' + k.algorithm)
+      const pubLen = fromBase64(k.publicKey).length
+      const secLen = fromBase64(k.secretKey).length
+      if (pubLen !== pub) throw new Error(alg + ': public key is ' + pubLen + ' bytes, expected ' + pub)
+      if (secLen !== sec) throw new Error(alg + ': secret key is ' + secLen + ' bytes, expected ' + sec)
+    }
+    const dflt = await generateAgentKeyPair()
+    if (dflt.algorithm !== 'ML-DSA-65') throw new Error('the default algorithm is ' + dflt.algorithm)
+    let caught = null
+    try { await generateAgentKeyPair({ algorithm: 'ML-DSA-99' }) } catch (err) { caught = err }
+    if (!(caught instanceof PQAuthError) || caught.code !== 'UNSUPPORTED_ALGORITHM') throw new Error('unknown algorithm: expected UNSUPPORTED_ALGORITHM, got ' + (caught && caught.code))
+    log('variants', Object.keys(sizes).join(', '))
+    pass('generateAgentKeyPair() — the three variants have the right sizes, 65 is the default and unknown names are rejected')
+  } catch (err) { fail('generateAgentKeyPair()', err) }
+
+  // 18.27 Agents with ML-DSA-44 and ML-DSA-87 keys — signAgentCall detects the variant, verify() grants
+  const variantIds = []
+  try {
+    for (const alg of ['ML-DSA-44', 'ML-DSA-87']) {
+      const keys = await generateAgentKeyPair({ algorithm: alg })
+      const r = await pq.mandate.emit({
+        agentId:          'agent_' + alg.slice(-2) + '_' + Date.now(),
+        issuedBy:         'sdk_integration_test',
+        scope:            ['read_tickets'],
+        budgetTotal:      5,
+        expiresInSeconds: 3600,
+        agentPublicKey:   keys.publicKey,
+      })
+      variantIds.push(r.mandate.id)
+      const sig = await signAgentCall({ mandate: r.mandate.token, action: 'read_tickets', cost: 1, secretKey: keys.secretKey })
+      if (sig.algorithm !== alg) throw new Error(alg + ': the signature is labelled ' + sig.algorithm)
+      const v = await pq.mandate.verify(r.mandate.token, 'read_tickets', 1, { agentSignature: sig })
+      if (v.result !== 'granted') throw new Error(alg + ': result is "' + v.result + '", expected "granted" (reason: ' + v.reason + ')')
+      log(alg, 'granted, budgetRemaining ' + v.budgetRemaining)
+    }
+    pass('mandate with an ML-DSA-44 and an ML-DSA-87 agent — signAgentCall detects the variant and verify() grants')
+  } catch (err) { fail('mandate — agent keys of other ML-DSA variants', err) }
+  for (const id of variantIds) { try { await pq.mandate.revoke(id) } catch { /* cleanup only */ } }
+
+  // 18.28 signAgentCall() — a wrong algorithm, a 32-byte seed and an unknown name are rejected locally
+  try {
+    const k87    = await generateAgentKeyPair({ algorithm: 'ML-DSA-87' })
+    const seed32 = Buffer.from(new Uint8Array(32)).toString('base64')
+    const cases = [
+      ['algorithm 65 with an 87 key', { secretKey: k87.secretKey, algorithm: 'ML-DSA-65' }, 'INVALID_SECRET_KEY'],
+      ['32-byte seed',                { secretKey: seed32 },                                 'INVALID_SECRET_KEY'],
+      ['unknown algorithm name',      { secretKey: k87.secretKey, algorithm: 'ML-DSA-99' }, 'UNSUPPORTED_ALGORITHM'],
+    ]
+    for (const [name, override, code] of cases) {
+      let caught = null
+      try { await signAgentCall({ mandate: 'mdt_local_check', action: 'read_tickets', cost: 1, ...override }) } catch (err) { caught = err }
+      if (!(caught instanceof PQAuthError)) throw new Error(name + ': expected a PQAuthError, got ' + caught)
+      if (caught.code !== code) throw new Error(name + ': code is "' + caught.code + '", expected "' + code + '"')
+    }
+    const ok = await signAgentCall({ mandate: 'mdt_local_check', action: 'read_tickets', cost: 1, secretKey: k87.secretKey, algorithm: 'ML-DSA-87' })
+    if (ok.algorithm !== 'ML-DSA-87') throw new Error('a matching algorithm was not accepted: ' + ok.algorithm)
+    log('checked', cases.map(c => c[0]).join(', '))
+    pass('signAgentCall() — a wrong algorithm, a 32-byte seed and an unknown name fail locally; a matching algorithm is accepted')
+  } catch (err) { fail('signAgentCall() — local checks of the key', err) }
+
+  // 18.29 The CA only takes ML-DSA-65: a key of another variant is refused with 400 (before anything is issued or charged)
+  try {
+    const k44 = await generateAgentKeyPair({ algorithm: 'ML-DSA-44' })
+    let caught = null
+    try {
+      await pq.ca.issue({ subject: 'device-wrong-variant-test', publicKey: k44.publicKey, expiresInSeconds: 3600 })
+    } catch (err) { caught = err }
+    if (caught === null) throw new Error('ca.issue() accepted an ML-DSA-44 public key')
+    if (!(caught instanceof PQAuthError) || caught.status !== 400) throw new Error('expected API_ERROR(400), got ' + caught)
+    log('message', caught.message)
+    pass('ca.issue() — an ML-DSA-44 public key is refused with 400 (the CA only takes ML-DSA-65)')
+  } catch (err) { fail('ca.issue() — key of another variant', err) }
+
+  // ─── 19 Local verify — Mandate tokens and non-ASCII claims ──────────────────
+  section('19 · verify() local — Mandate tokens and non-ASCII claims')
+
+  try {
+    if (!mandateToken) throw new Error('skipped — section 18 did not produce a mandate token')
+    const local = await pqLocal.verify(mandateToken)
+    if (local.valid) throw new Error('a Mandate token verified as a normal token (local)')
+    if (!/Mandate token/.test(local.error ?? '')) throw new Error('unexpected local error: ' + local.error)
+    if (local.local !== true) throw new Error('local should be true')
+    const remote = await pq.verify(mandateToken)
+    if (remote.valid) throw new Error('a Mandate token verified as a normal token (remote)')
+    log('local error',  local.error)
+    log('remote error', remote.error)
+    pass('verify() — a Mandate token is rejected, locally and remotely')
+  } catch (err) { fail('verify() — Mandate token', err) }
+
+  try {
+    const name = 'José Ñandú'
+    const city = 'Córdoba €'
+    const { token } = await pq.sign({ sub: 'user_utf8', name, city })
+    const r = await pqLocal.verify(token)
+    if (!r.valid) throw new Error('valid is false: ' + r.error)
+    if (r.payload.name !== name || r.payload.city !== city) throw new Error('claims came back as ' + JSON.stringify([r.payload.name, r.payload.city]))
+    log('name', r.payload.name)
+    log('city', r.payload.city)
+    pass('verify() local — non-ASCII claims come back intact (UTF-8)')
+  } catch (err) { fail('verify() local — non-ASCII claims', err) }
 
   // ─── Summary ─────────────────────────────────────────────────────────────────
   const total = passed + failed

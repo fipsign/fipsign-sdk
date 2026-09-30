@@ -1,5 +1,5 @@
 /**
- * fipsign-sdk v0.12.0
+ * fipsign-sdk
  *
  * Post-quantum signing SDK for Node.js and the browser.
  * Uses ML-DSA-44, ML-DSA-65, or ML-DSA-87 (NIST FIPS 204) — resistant to quantum computers.
@@ -25,7 +25,9 @@ export interface SignOptions {
   expiresInSeconds?: number
   /**
    * Any additional fields are stored in the token payload and returned on verify().
-   * Reserved fields: `_iss` (issuer — set automatically by the server, ignored if provided).
+   * Field names starting with `_` are reserved for the server. `_iss` (issuer) is set
+   * automatically and ignored if provided; any other `_` field makes the request fail with
+   * HTTP 400 (for example `_mandate`, which only Mandate tokens carry).
    */
   [key: string]:     unknown
 }
@@ -222,6 +224,10 @@ export interface VerifyCertResult {
 
 // ─── Mandate types ────────────────────────────────────────────────────────────
 
+/**
+ * `status` only tracks what was done to a mandate: it is never "expired". Whether a mandate
+ * has expired is told by `expiresAt` and `expiresInSeconds` (0 once it has expired).
+ */
 export type MandateStatus = 'active' | 'suspended' | 'revoked'
 
 export interface Mandate {
@@ -232,12 +238,16 @@ export interface Mandate {
   scopeCurrent:     string[]
   budgetTotal:      number
   budgetConsumed:   number
+  /** Always 0 when `budgetTotal` is 0 (unlimited): use `budgetConsumed` to see the usage. */
   budgetRemaining:  number
   status:           MandateStatus
   issuedAt:         number
   expiresAt:        number
+  /** Seconds left until `expiresAt`; 0 once the mandate has expired. */
   expiresInSeconds: number
   updatedAt:        number
+  /** true when the mandate was emitted with `agentPublicKey`: every verify then needs the agent's signature. */
+  requiresAgentSignature: boolean
 }
 
 export interface MandateEmitOptions {
@@ -246,6 +256,13 @@ export interface MandateEmitOptions {
   scope:            string[]
   budgetTotal:      number
   expiresInSeconds: number
+  /**
+   * Optional proof of possession. Base64 ML-DSA public key of the agent (any of the three
+   * variants; generateAgentKeyPair() makes one). When set, every mandate.verify() must also carry an
+   * `agentSignature` made with the matching private key (see signAgentCall()). The private key
+   * never reaches FIPSign. Without it the mandate is a plain bearer token.
+   */
+  agentPublicKey?:  string
 }
 
 export interface MandateEmitResult {
@@ -258,6 +275,8 @@ export interface MandateEmitResult {
     expiresAt:   number
     status:      MandateStatus
     token:       PQToken
+    /** Present (true) only when the mandate was emitted with `agentPublicKey`. */
+    requiresAgentSignature?: true
   }
   usage: {
     freeRemaining:  number
@@ -267,9 +286,25 @@ export interface MandateEmitResult {
   }
 }
 
+/**
+ * Reasons for a denied mandate.verify(). The type stays open on purpose: failures that never
+ * reach the mandate checks (invalid API key, rate limit, network error) put their own message in `reason`.
+ */
+export type MandateDenyReason =
+  | 'invalid_signature'
+  | 'mandate_expired'
+  | 'mandate_revoked'
+  | 'mandate_suspended'
+  | 'scope_not_authorized'
+  | 'budget_exhausted'
+  | 'agent_signature_required'
+  | 'agent_signature_invalid'
+  | 'agent_signature_mismatch'
+  | 'agent_signature_replayed'
+
 export interface MandateVerifyResult {
   result:               'granted' | 'denied'
-  reason?:              string
+  reason?:              MandateDenyReason | (string & {})
   actionMatched?:       string
   budgetRemaining?:     number
   expiresInSeconds?:    number
@@ -282,6 +317,11 @@ export interface MandateVerifyResult {
     totalRemaining: number
     month:          string
   }
+}
+
+export interface MandateVerifyOptions {
+  /** Required when the mandate was emitted with `agentPublicKey`. Made by signAgentCall(); single use. */
+  agentSignature?: PQToken
 }
 
 export interface MandatePatchResult {
@@ -297,9 +337,19 @@ export interface MandateGetResult {
   mandate: Mandate
 }
 
+export interface MandateListOptions {
+  /** Page size. The server validates it (it sets the default and the maximum). */
+  limit?:  number
+  /** The `nextCursor` of the previous page, exactly as received. Omit it for the first page. */
+  cursor?: string
+}
+
 export interface MandateListResult {
-  mandates: Mandate[]
-  total:    number
+  mandates:   Mandate[]
+  /** Number of mandates in THIS page. A page can hold fewer than `limit`, even none. */
+  count:      number
+  /** Pass it as `cursor` to get the next page. null on the last page. */
+  nextCursor: string | null
 }
 
 // ─── Middleware types ─────────────────────────────────────────────────────────
@@ -348,6 +398,17 @@ async function sha256Hex(text: string): Promise<string> {
   return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
+// A token payload is JSON text carried as base64 of its UTF-8 bytes (this is what the server does).
+// atob()/btoa() alone only handle Latin-1, so accents, € or emoji would come out garbled or throw.
+function encodePayloadJson(json: string): string {
+  return toBase64(new TextEncoder().encode(json))
+}
+
+// Strict: bytes that are not valid UTF-8 throw instead of being silently replaced.
+function decodePayloadJson(b64: string): string {
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(fromBase64(b64))
+}
+
 // ─── Local token verification ─────────────────────────────────────────────────
 
 function getMlDsa(algorithm: string) {
@@ -375,7 +436,12 @@ function verifyLocally(
       'INVALID_SIGNATURE'
     )
   }
-  const payload: TokenPayload = JSON.parse(atob(token.payload))
+  let payload: TokenPayload
+  try {
+    payload = JSON.parse(decodePayloadJson(token.payload))
+  } catch {
+    throw new PQAuthError('Invalid token payload — not valid UTF-8 JSON', 'INVALID_PAYLOAD')
+  }
   const now = Math.floor(Date.now() / 1000)
   if (payload.exp < now) {
     throw new PQAuthError(`Token expired ${now - payload.exp} seconds ago`, 'TOKEN_EXPIRED')
@@ -386,6 +452,11 @@ function verifyLocally(
       'Invalid signature — token was tampered with or not issued by this server',
       'ISSUER_MISMATCH'
     )
+  }
+  // A Mandate token is not a normal token: this function only checks signature and expiry, so it
+  // would say "valid" even for a revoked or suspended mandate. Same rule as POST /verify on the server.
+  if (payload._mandate === true) {
+    throw new PQAuthError('This is a Mandate token. Verify it with mandate.verify()', 'MANDATE_TOKEN')
   }
   return payload
 }
@@ -457,7 +528,11 @@ function verifyCertLocally(cert: PQCert, rootCert: PQCert): void {
  * Generate an ML-DSA-65 key pair for a device or entity.
  *
  * The entity keeps the secretKey private and passes the publicKey
- * to pqauth.ca.issue() to obtain a certificate.
+ * to pqauth.ca.issue() to obtain a certificate. The CA only accepts ML-DSA-65 keys, which is
+ * why this function has no options.
+ *
+ * For the key pair of a Mandate agent use generateAgentKeyPair() instead: it also offers
+ * ML-DSA-44 and ML-DSA-87.
  *
  * @example
  * const { publicKey, secretKey } = await generateKeyPair()
@@ -476,6 +551,170 @@ export async function generateKeyPair(): Promise<{ publicKey: string; secretKey:
   return {
     publicKey: toBase64(keys.publicKey),
     secretKey: toBase64(keys.secretKey),
+  }
+}
+
+// ─── generateAgentKeyPair (Mandate proof of possession) ───────────────────────
+
+export type MlDsaVariant = 'ML-DSA-44' | 'ML-DSA-65' | 'ML-DSA-87'
+
+export interface GenerateAgentKeyPairOptions {
+  /** ML-DSA variant of the key pair. Default 'ML-DSA-65'. FIPSign accepts any of the three for a Mandate agent. */
+  algorithm?: MlDsaVariant
+}
+
+export interface AgentKeyPair {
+  /** Base64 public key. Pass it as `agentPublicKey` to pqauth.mandate.emit(). */
+  publicKey: string
+  /** Base64 private key. Keep it on the agent and never send it anywhere. Pass it to signAgentCall(). */
+  secretKey: string
+  /** The ML-DSA variant of this key pair. */
+  algorithm: MlDsaVariant
+}
+
+/**
+ * Generate the key pair of a Mandate agent (proof of possession).
+ *
+ * The agent keeps the secretKey; only the publicKey goes to FIPSign, as `agentPublicKey` of
+ * pqauth.mandate.emit(). Unlike generateKeyPair() (which is for CA certificates and is always
+ * ML-DSA-65) you can choose the variant here: ML-DSA-44, ML-DSA-65 (default) or ML-DSA-87.
+ * Do not use these keys with pqauth.ca.issue(): the CA only accepts ML-DSA-65.
+ *
+ * @example
+ * const { publicKey, secretKey } = await generateAgentKeyPair({ algorithm: 'ML-DSA-87' })
+ * const { mandate } = await pqauth.mandate.emit({ ..., agentPublicKey: publicKey })
+ * // later, on the agent: signAgentCall({ mandate: mandate.token, action, cost, secretKey })
+ */
+export async function generateAgentKeyPair(options: GenerateAgentKeyPairOptions = {}): Promise<AgentKeyPair> {
+  const algorithm = options?.algorithm ?? 'ML-DSA-65'
+  const mlDsa     = getMlDsa(algorithm)   // anything else fails with UNSUPPORTED_ALGORITHM
+  const seed = new Uint8Array(32)
+  crypto.getRandomValues(seed)
+  const keys = mlDsa.keygen(seed)
+  seed.fill(0)
+  return {
+    publicKey: toBase64(keys.publicKey),
+    secretKey: toBase64(keys.secretKey),
+    algorithm,
+  }
+}
+
+// Size in bytes of the expanded ML-DSA private key, per variant. The three sizes are different, so the
+// size of a secretKey tells which variant it is.
+const AGENT_SECRET_KEY_VARIANT: Record<number, MlDsaVariant | undefined> = {
+  2560: 'ML-DSA-44',
+  4032: 'ML-DSA-65',
+  4896: 'ML-DSA-87',
+}
+
+// ─── signAgentCall (Mandate proof of possession) ──────────────────────────────
+
+// Default life of an agent signature. The server accepts at most 60 seconds and rejects anything longer
+// as agent_signature_invalid; half of that leaves room for clock differences between agent and server.
+const DEFAULT_AGENT_SIGNATURE_LIFETIME_SECONDS = 30
+
+export interface SignAgentCallOptions {
+  /** The mandate id (`mandate.id`) or the mandate token itself (the id is read from its `sub`). */
+  mandate:           string | PQToken
+  /** The action being requested: exactly what will be passed to mandate.verify(). */
+  action:            string
+  /** The cost being requested: exactly what will be passed to mandate.verify(). */
+  cost:              number
+  /** The agent's base64 private key, as returned by generateAgentKeyPair(). It is never sent anywhere. */
+  secretKey:         string
+  /**
+   * ML-DSA variant of the key. Optional: it is detected from the size of the secretKey. If you pass it,
+   * it must match the key, otherwise the call fails with INVALID_SECRET_KEY.
+   */
+  algorithm?:        MlDsaVariant
+  /** Life of the signature in seconds. Default 30. The server rejects anything above its maximum (60). */
+  expiresInSeconds?: number
+}
+
+/**
+ * Sign one Mandate call with the agent's private key (proof of possession).
+ *
+ * Use it on the agent's side; no API key is needed and the private key never leaves the agent.
+ * The result goes to the service that calls `pqauth.mandate.verify(token, action, cost, { agentSignature })`.
+ *
+ * The signature covers this exact mandate, action and cost, lives a few seconds and can be used
+ * ONCE (the server remembers it): make a new one for every call.
+ *
+ * The ML-DSA variant (44, 65 or 87) is detected from the secretKey: you do not have to say it.
+ *
+ * @example
+ * const { publicKey, secretKey } = await generateAgentKeyPair()   // once; keep secretKey on the agent
+ * // ...emit the mandate with agentPublicKey: publicKey...
+ * const agentSignature = await signAgentCall({ mandate: mandate.token, action: 'send_reply', cost: 1, secretKey })
+ * const check = await pqauth.mandate.verify(mandate.token, 'send_reply', 1, { agentSignature })
+ */
+export async function signAgentCall(options: SignAgentCallOptions): Promise<PQToken> {
+  const { mandate, secretKey } = options
+  const lifetime  = options.expiresInSeconds ?? DEFAULT_AGENT_SIGNATURE_LIFETIME_SECONDS
+
+  let mandateId: unknown = mandate
+  if (typeof mandate === 'object' && mandate !== null) {
+    try {
+      mandateId = (JSON.parse(decodePayloadJson(mandate.payload)) as { sub?: unknown }).sub
+    } catch {
+      throw new PQAuthError('"mandate" is not a valid Mandate token', 'INVALID_ARGUMENT')
+    }
+  }
+  if (typeof mandateId !== 'string' || mandateId.trim() === '') {
+    throw new PQAuthError('"mandate" must be the mandate id or the mandate token', 'INVALID_ARGUMENT')
+  }
+  if (typeof options.action !== 'string' || options.action.trim() === '') {
+    throw new PQAuthError('"action" must be a non-empty string', 'INVALID_ARGUMENT')
+  }
+  if (!Number.isInteger(options.cost) || options.cost < 0) {
+    throw new PQAuthError('"cost" must be a non-negative integer', 'INVALID_ARGUMENT')
+  }
+  if (!Number.isInteger(lifetime) || lifetime < 1) {
+    throw new PQAuthError('"expiresInSeconds" must be a positive integer', 'INVALID_ARGUMENT')
+  }
+  if (typeof secretKey !== 'string' || secretKey === '') {
+    throw new PQAuthError('"secretKey" is required', 'INVALID_ARGUMENT')
+  }
+
+  if (options.algorithm !== undefined) getMlDsa(options.algorithm)   // an unknown name fails with UNSUPPORTED_ALGORITHM
+  const now     = Math.floor(Date.now() / 1000)
+  const payload = encodePayloadJson(JSON.stringify({
+    sub:    mandateId.trim(),
+    action: options.action.trim(),
+    cost:   options.cost,
+    iat:    now,
+    exp:    now + lifetime,
+  }))
+
+  let secret: Uint8Array | undefined
+  try {
+    try {
+      secret = fromBase64(secretKey)
+    } catch {
+      throw new PQAuthError('"secretKey" is not valid base64', 'INVALID_SECRET_KEY')
+    }
+    // The size of an ML-DSA private key tells its variant (2560, 4032 or 4896 bytes).
+    const detected = AGENT_SECRET_KEY_VARIANT[secret.length]
+    if (detected === undefined) {
+      throw new PQAuthError(
+        `"secretKey" is not an ML-DSA private key (${secret.length} bytes; expected 2560, 4032 or 4896). ` +
+        'Use the secretKey returned by generateAgentKeyPair(); a 32-byte seed is not accepted',
+        'INVALID_SECRET_KEY'
+      )
+    }
+    if (options.algorithm !== undefined && options.algorithm !== detected) {
+      throw new PQAuthError(
+        `"algorithm" is ${options.algorithm} but the secretKey is an ${detected} key. Omit "algorithm": it is detected from the key`,
+        'INVALID_SECRET_KEY'
+      )
+    }
+    const signature = getMlDsa(detected).sign(new TextEncoder().encode(payload), secret)
+    return { payload, signature: toBase64(signature), algorithm: detected, issuedAt: now }
+  } catch (err) {
+    if (err instanceof PQAuthError) throw err
+    throw new PQAuthError('"secretKey" is not a valid ML-DSA private key', 'INVALID_SECRET_KEY')
+  } finally {
+    secret?.fill(0)
   }
 }
 
@@ -632,6 +871,9 @@ export class PQAuth {
    * Local verification does not check the revocation list — use remote verification
    * for sensitive operations such as payments or admin actions.
    *
+   * A Mandate token is never a valid session token: verify() rejects it in both modes.
+   * Use mandate.verify() for those.
+   *
    * @example
    * const { valid, payload } = await pqauth.verify(token)
    * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
@@ -753,7 +995,7 @@ private async verifyLocal(token: PQToken): Promise<VerifyResult> {
      * Free — no token cost.
      */
     getCert: (certId: string): Promise<CaGetCertResult> =>
-      this.request<CaGetCertResult>(`/ca/certificate/${certId}`),
+      this.request<CaGetCertResult>(`/ca/certificate/${encodeURIComponent(certId)}`),
 
     /**
      * Get the Certificate Revocation List for this project's CA.
@@ -976,10 +1218,25 @@ getCrl: async (): Promise<CaGetCrlResult> => {
   readonly mandate = {
 
     /**
-     * Emit a new mandate. Costs 1 token.
+     * Emit a new mandate. Billed at the platform price of POST /mandate (see the pricing table
+     * in the guide).
      *
      * `budgetTotal: 0` means unlimited budget — the rejection check is
-     * skipped, but budgetConsumed still accumulates.
+     * skipped, but budgetConsumed still accumulates (budgetRemaining stays 0).
+     *
+     * Pass `agentPublicKey` to require proof of possession: the mandate token stops being a
+     * pure bearer credential, and every verify() must carry an `agentSignature` made with the
+     * agent's private key. The agent keeps the private key; only the public key reaches FIPSign.
+     *
+     * @example — mandate with proof of possession
+     * // where the agent lives (keep secretKey there). Pass { algorithm: 'ML-DSA-44' | 'ML-DSA-87' } to choose the variant:
+     * const { publicKey, secretKey } = await generateAgentKeyPair()
+     * // where you emit the mandate:
+     * const { mandate } = await pqauth.mandate.emit({ ..., agentPublicKey: publicKey })
+     * // each time the agent acts (agent side, no API key needed):
+     * const agentSignature = await signAgentCall({ mandate: mandate.token, action: 'send_reply', cost: 1, secretKey })
+     * // each time the service checks it:
+     * const check = await pqauth.mandate.verify(mandate.token, 'send_reply', 1, { agentSignature })
      */
     emit: (options: MandateEmitOptions): Promise<MandateEmitResult> =>
       this.request<MandateEmitResult>('/mandate', {
@@ -994,8 +1251,14 @@ getCrl: async (): Promise<CaGetCrlResult> => {
      *
      * Never throws — returns { result: 'denied', reason } on any failure
      * (invalid signature, expired, suspended, revoked, action not in
-     * scope, or budget exhausted). Only billed 1 token when the result is
-     * 'granted' — a denied check is always free.
+     * scope, budget exhausted, or a missing/invalid agent signature). Billed (at the
+     * platform price of POST /mandate/verify) only when the result is 'granted' — a denied
+     * check is always free. `reason` is one of MandateDenyReason, or the real error message
+     * for failures that never reach the mandate checks (invalid API key, rate limit, network).
+     *
+     * If the mandate was emitted with `agentPublicKey`, pass the agent's signature (made with
+     * signAgentCall) in `options.agentSignature`. It covers this exact mandate, action and
+     * cost, expires within seconds and can be used once: make a new one for every call.
      *
      * Unlike pqauth.verify(), there is no local/offline mode here: budget
      * and scope are live mutable state that can only be checked against
@@ -1005,7 +1268,7 @@ getCrl: async (): Promise<CaGetCrlResult> => {
      * const check = await pqauth.mandate.verify(token, 'send_email', 1)
      * if (check.result !== 'granted') return reject(check.reason)
      */
-    verify: async (token: PQToken, action: string, cost: number): Promise<MandateVerifyResult> => {
+    verify: async (token: PQToken, action: string, cost: number, options?: MandateVerifyOptions): Promise<MandateVerifyResult> => {
       const controller = new AbortController()
       const timer      = setTimeout(() => controller.abort(), this.timeout)
       try {
@@ -1013,7 +1276,7 @@ getCrl: async (): Promise<CaGetCrlResult> => {
           method:  'POST',
           signal:  controller.signal,
           headers: { 'Content-Type': 'application/json', 'X-API-Key': this.apiKey },
-          body:    JSON.stringify({ token, action, cost }),
+          body:    JSON.stringify({ token, action, cost, ...(options?.agentSignature ? { agentSignature: options.agentSignature } : {}) }),
         })
         // Deliberately NOT using this.request() here: a 'denied' result is
         // a normal, expected outcome carrying real data (reason,
@@ -1048,39 +1311,77 @@ getCrl: async (): Promise<CaGetCrlResult> => {
      * the original scope. To restore scope, emit a new mandate.
      */
     narrow: (mandateId: string, scope: string[]): Promise<MandatePatchResult> =>
-      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+      this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
         body:   JSON.stringify({ action: 'narrow', scope }),
       }),
 
     /** Temporarily pause a mandate. verify() will deny while suspended. */
     suspend: (mandateId: string): Promise<MandatePatchResult> =>
-      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+      this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
         body:   JSON.stringify({ action: 'suspend' }),
       }),
 
     /** Reactivate a suspended mandate. */
     resume: (mandateId: string): Promise<MandatePatchResult> =>
-      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+      this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
         body:   JSON.stringify({ action: 'resume' }),
       }),
 
     /** Permanently terminate a mandate. Irreversible. */
     revoke: (mandateId: string): Promise<MandatePatchResult> =>
-      this.request<MandatePatchResult>(`/mandate/${mandateId}`, {
+      this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
         body:   JSON.stringify({ action: 'revoke' }),
       }),
 
     /** Get a mandate's current state by id. Free — no token cost. */
     get: (mandateId: string): Promise<MandateGetResult> =>
-      this.request<MandateGetResult>(`/mandate/${mandateId}`),
+      this.request<MandateGetResult>(`/mandate/${encodeURIComponent(mandateId)}`),
 
-    /** List all mandates for this project. Free — no token cost. */
-    list: (): Promise<MandateListResult> =>
-      this.request<MandateListResult>('/mandate'),
+    /**
+     * List one page of this project's mandates, newest first. Free — no token cost.
+     *
+     * A page can hold fewer than `limit` mandates (even none) while `nextCursor` is not null:
+     * keep following `nextCursor` until it is null, or use listAll().
+     */
+    list: (options?: MandateListOptions): Promise<MandateListResult> => {
+      const params = new URLSearchParams()
+      if (options?.limit  !== undefined) params.set('limit',  String(options.limit))
+      if (options?.cursor !== undefined) params.set('cursor', options.cursor)
+      const query = params.toString()
+      return this.request<MandateListResult>(query ? `/mandate?${query}` : '/mandate')
+    },
+
+    /**
+     * Iterate over every mandate of this project, newest first, following nextCursor page by page.
+     * Free — no token cost. Stop early with `break`: no further page is requested.
+     *
+     * @example
+     * for await (const m of pqauth.mandate.listAll()) console.log(m.id, m.status)
+     */
+    listAll: (options?: { limit?: number }): AsyncGenerator<Mandate, void, undefined> =>
+      this.iterateMandates(options?.limit),
+  }
+
+  // Follows nextCursor until it is null. A page can be short or empty while more pages exist, so the
+  // loop is driven by the cursor, never by the page size.
+  private async *iterateMandates(limit?: number): AsyncGenerator<Mandate, void, undefined> {
+    let cursor: string | undefined
+    for (;;) {
+      const page = await this.mandate.list({
+        ...(limit  !== undefined ? { limit }  : {}),
+        ...(cursor !== undefined ? { cursor } : {}),
+      })
+      for (const m of page.mandates) yield m
+      if (page.nextCursor === null) return
+      if (page.nextCursor === cursor) {
+        throw new PQAuthError('Pagination cursor did not advance', 'API_ERROR')
+      }
+      cursor = page.nextCursor
+    }
   }
 
   // ── zes ──────────────────────────────────────────────────────────────────────
