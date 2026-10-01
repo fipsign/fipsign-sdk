@@ -19,6 +19,7 @@
  *   Mandate section (18), on top of the ~29 above: 4 emits + 6 granted verify() calls. Emit and verify
  *   are priced by the platform (2 tokens each today, see the guide), so 20 tokens; PATCH/GET/LIST and
  *   denied verify() calls are free. Section 19: 1 sign() = 1 token.
+ *   Section 20: 1 sign() + 2 verify() + 1 mandate.emit() = 5 tokens; the rest runs against a stub server on localhost.
  *
  * Prerequisites:
  *   1. Create a free account at https://app.fipsign.dev
@@ -28,6 +29,7 @@
  */
 
 import { createHmac } from 'crypto'
+import { createServer } from 'node:http'
 import { PQAuth, PQAuthError, generateKeyPair, generateAgentKeyPair, signAgentCall } from 'fipsign-sdk'
 import { ml_dsa44, ml_dsa65, ml_dsa87 } from '@noble/post-quantum/ml-dsa.js'
 
@@ -1443,6 +1445,107 @@ async function run() {
     log('city', r.payload.city)
     pass('verify() local — non-ASCII claims come back intact (UTF-8)')
   } catch (err) { fail('verify() local — non-ASCII claims', err) }
+
+  // ─── 20 A failed check is not a rejected token ──────────────────────────────
+  section('20 · verify() / PQAuthError — a failed check is not a rejected token')
+
+  try {
+    const { token } = await pq.sign({ sub: 'failure_test', expiresInSeconds: 3600 })
+    const r = await pq.verify({ ...token, payload: 'TAMPERED_PAYLOAD' })
+    if (r.valid) throw new Error('a tampered token was accepted')
+    if (r.failure !== 'rejected') throw new Error('failure is ' + JSON.stringify(r.failure) + ', expected "rejected"')
+    if (r.retryAfter !== undefined) throw new Error('retryAfter is set on a rejection')
+    log('error', r.error)
+    pass('verify() — a tampered token is failure "rejected"')
+  } catch (err) { fail('verify() — a tampered token is failure "rejected"', err) }
+
+  // A stub FIPSign on localhost answers with exactly the replies we need (no tokens spent, no waiting).
+  let reply = { status: 200, headers: {}, body: { success: true, valid: true, payload: { sub: 'u', iat: 1, exp: 9999999999 } } }
+  const stub = createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(reply.status, { 'Content-Type': 'application/json', ...reply.headers })
+      res.end(JSON.stringify(reply.body))
+    })
+  })
+  await new Promise(resolve => stub.listen(0, resolve))
+  const stubUrl = 'http://localhost:' + stub.address().port
+  const pqStub  = new PQAuth({ apiKey: 'pqa_' + 'a'.repeat(64), baseUrl: stubUrl, timeout: 2000 })
+  const someToken = { payload: 'eyJ4IjoxfQ==', signature: 'AAAA', algorithm: 'ML-DSA-65', issuedAt: 1 }
+  const RATE  = { success: false, error: 'Rate limit exceeded. Maximum 300 requests per minute per API key.', code: 'rate_limited' }
+  const QUOTA = { success: false, error: 'Token limit reached.', code: 'token_quota_exhausted' }
+
+  try {
+    const cases = [
+      ['401 valid:false (revoked)',       401, {},                   { success: false, valid: false, error: 'Token has been revoked' }, 'rejected',        undefined],
+      ['400 malformed token',             400, {},                   { success: false, error: 'Invalid token format' },                  'rejected',        undefined],
+      ['429 rate_limited + Retry-After 7', 429, { 'Retry-After': '7' }, RATE,                                                            'rate_limited',    7],
+      ['429 token_quota_exhausted',       429, {},                   QUOTA,                                                            'quota_exhausted', undefined],
+      ['401 invalid API key (no "valid")', 401, {},                  { success: false, error: 'API key required or invalid.' },        'unavailable',     undefined],
+      ['500 server error',                500, {},                   { success: false, error: 'Internal server error' },               'unavailable',     undefined],
+    ]
+    for (const [label, status, headers, body, failure, retryAfter] of cases) {
+      reply = { status, headers, body }
+      const r = await pqStub.verify(someToken)
+      if (r.valid !== false || r.failure !== failure || r.retryAfter !== retryAfter) {
+        throw new Error(label + ' → valid=' + r.valid + ' failure=' + r.failure + ' retryAfter=' + r.retryAfter + ', expected ' + failure + ' / ' + retryAfter)
+      }
+      log(label, failure + (retryAfter === undefined ? '' : ' (retryAfter ' + retryAfter + ')'))
+    }
+    pass('verify() — rejected / rate_limited / quota_exhausted / unavailable are told apart')
+  } catch (err) { fail('verify() — failure kinds', err) }
+
+  try {
+    reply = { status: 429, headers: { 'Retry-After': '7' }, body: RATE }
+    let e1; try { await pqStub.sign({ sub: 'x' }) } catch (e) { e1 = e }
+    if (!(e1 instanceof PQAuthError)) throw new Error('sign() did not throw a PQAuthError')
+    if (e1.code !== 'API_ERROR' || e1.status !== 429 || e1.serverCode !== 'rate_limited' || e1.retryAfter !== 7) {
+      throw new Error('rate limit error is ' + JSON.stringify({ code: e1.code, status: e1.status, serverCode: e1.serverCode, retryAfter: e1.retryAfter }))
+    }
+    reply = { status: 429, headers: {}, body: QUOTA }
+    let e2; try { await pqStub.sign({ sub: 'x' }) } catch (e) { e2 = e }
+    if (e2?.serverCode !== 'token_quota_exhausted' || e2.retryAfter !== undefined) throw new Error('quota error is ' + JSON.stringify({ serverCode: e2?.serverCode, retryAfter: e2?.retryAfter }))
+    pass('PQAuthError — serverCode and retryAfter tell a rate limit from an exhausted quota')
+  } catch (err) { fail('PQAuthError — serverCode and retryAfter', err) }
+
+  try {
+    reply = { status: 429, headers: { 'Retry-After': '7' }, body: RATE }
+    const z = await pqStub.zes.verify(someToken, { a: 1 })
+    if (z.valid !== false || z.dataMatches !== false || z.failure !== 'rate_limited' || z.retryAfter !== 7) {
+      throw new Error('zes.verify() answered ' + JSON.stringify({ valid: z.valid, dataMatches: z.dataMatches, failure: z.failure, retryAfter: z.retryAfter }))
+    }
+    pass('zes.verify() — carries failure and retryAfter')
+  } catch (err) { fail('zes.verify() — failure and retryAfter', err) }
+
+  try {
+    const call = async () => {
+      const out = {}
+      const res = { status(c) { out.status = c; return res }, json(b) { out.body = b }, setHeader(k, v) { out.header = [k, v] } }
+      await pqStub.middleware()({ headers: { authorization: 'Bearer ' + Buffer.from(JSON.stringify(someToken)).toString('base64') } }, res, () => { out.next = true })
+      return out
+    }
+    reply = { status: 401, headers: {}, body: { success: false, valid: false, error: 'Token has been revoked' } }
+    const rejected = await call()
+    if (rejected.status !== 401 || rejected.body.error !== 'Token has been revoked') throw new Error('a refused token did not give 401: ' + JSON.stringify(rejected))
+    reply = { status: 429, headers: { 'Retry-After': '7' }, body: RATE }
+    const limited = await call()
+    if (limited.status !== 503 || limited.header?.join('=') !== 'Retry-After=7' || limited.body.error !== 'Authentication service temporarily unavailable') {
+      throw new Error('a rate limit did not give 503 + Retry-After: ' + JSON.stringify(limited))
+    }
+    reply = { status: 500, headers: {}, body: { success: false, error: 'Internal server error' } }
+    const down = await call()
+    if (down.status !== 503 || down.header !== undefined) throw new Error('a server error did not give a plain 503: ' + JSON.stringify(down))
+    pass('middleware() — 401 only for a refused token, 503 when FIPSign could not check')
+  } catch (err) { fail('middleware() — 401 vs 503', err) }
+
+  try {
+    const { mandate } = await pq.mandate.emit({ agentId: 'failure_test', issuedBy: 'test-sdk', scope: ['read'], budgetTotal: 1, expiresInSeconds: 600 })
+    const m = await pq.verify(mandate.token)
+    if (m.valid || m.failure !== 'rejected') throw new Error('a Mandate token on verify() gave failure ' + m.failure)
+    pass('verify() — a Mandate token is failure "rejected"')
+  } catch (err) { fail('verify() — a Mandate token is "rejected"', err) }
+
+  stub.close()
 
   // ─── Summary ─────────────────────────────────────────────────────────────────
   const total = passed + failed

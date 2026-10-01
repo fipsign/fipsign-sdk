@@ -59,11 +59,31 @@ export interface SignResult {
   }
 }
 
+/**
+ * Why verify() answered `valid: false`.
+ *
+ * - `'rejected'`        FIPSign looked at the token and it is not acceptable: bad signature, expired, revoked,
+ *                       malformed, issued for another project, or a Mandate token. Answer 401.
+ * - `'rate_limited'`    Your API key sent too many requests in the current minute. The token was NOT checked:
+ *                       wait `retryAfter` seconds and try again.
+ * - `'quota_exhausted'` Your free tokens and your packs are used up. The token was NOT checked and waiting
+ *                       does not help: buy a pack from the dashboard.
+ * - `'unavailable'`     FIPSign could not answer: timeout, network failure, a server error, or an invalid API key.
+ *                       The token was NOT checked.
+ *
+ * Only `'rejected'` says something about the token. Do not log a user out because of the other three.
+ */
+export type VerifyFailure = 'rejected' | 'rate_limited' | 'quota_exhausted' | 'unavailable'
+
 export interface VerifyResult {
   valid:   boolean
   payload: TokenPayload | null
   error?:  string
   local?:  boolean
+  /** Why `valid` is false. Absent when `valid` is true. See VerifyFailure. */
+  failure?:    VerifyFailure
+  /** Seconds to wait before trying again. Only present with `failure: 'rate_limited'`. */
+  retryAfter?: number
 }
 
 export interface TokenPayload {
@@ -359,8 +379,10 @@ export interface MiddlewareRequest {
 }
 
 export interface MiddlewareResponse {
-  status: (code: number) => MiddlewareResponse
-  json:   (data: unknown) => void
+  status:     (code: number) => MiddlewareResponse
+  json:       (data: unknown) => void
+  /** Used to send Retry-After with a 503. Express, and Fastify through @fastify/express, have it. */
+  setHeader?: (name: string, value: string) => unknown
 }
 
 export type NextFunction = (err?: unknown) => void
@@ -368,14 +390,77 @@ export type NextFunction = (err?: unknown) => void
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 export class PQAuthError extends Error {
+  /**
+   * The `code` field of the server's error answer, when it has one. Today: `'rate_limited'` (too many
+   * requests in the current minute) or `'token_quota_exhausted'` (free tokens and packs used up).
+   * `code` below stays `'API_ERROR'` for both.
+   */
+  public readonly serverCode?: string
+  /** Seconds to wait, from the `Retry-After` header of the server's answer. Sent with `'rate_limited'`. */
+  public readonly retryAfter?: number
+
   constructor(
     message: string,
     public readonly code: string,
-    public readonly status?: number
+    public readonly status?: number,
+    extra?: { serverCode?: string; retryAfter?: number }
   ) {
     super(message)
     this.name = 'PQAuthError'
+    this.serverCode = extra?.serverCode
+    this.retryAfter = extra?.retryAfter
   }
+}
+
+// Retry-After as a whole number of seconds (the only form FIPSign sends); anything else is ignored.
+function parseRetryAfter(value: string | null | undefined): number | undefined {
+  const text = value?.trim()
+  return text !== undefined && /^\d+$/.test(text) ? Number(text) : undefined
+}
+
+// The error for an answer that is not a success: keeps the server's `code` and Retry-After.
+function apiError(
+  status: number,
+  data: { error?: string; code?: unknown } | null,
+  retryAfter: number | undefined
+): PQAuthError {
+  return new PQAuthError(
+    data?.error ?? `Request failed with status ${status}`,
+    'API_ERROR',
+    status,
+    { serverCode: typeof data?.code === 'string' ? data.code : undefined, retryAfter }
+  )
+}
+
+// True for the errors of fetching the public key (local verification): no answer, or an answer that is not the key.
+function isNoAnswer(err: unknown): err is PQAuthError {
+  return err instanceof PQAuthError && (err.code === 'NETWORK_ERROR' || err.code === 'TIMEOUT')
+}
+
+function noAnswerResult(err: PQAuthError): VerifyResult {
+  const base = { valid: false, payload: null, error: err.message, local: true } as const
+  if (err.status === 429) {
+    return err.retryAfter === undefined
+      ? { ...base, failure: 'rate_limited' }
+      : { ...base, failure: 'rate_limited', retryAfter: err.retryAfter }
+  }
+  return { ...base, failure: 'unavailable' }
+}
+
+// What a failed POST /verify answer means: the token was refused, or FIPSign could not decide.
+function classifyVerifyFailure(
+  status: number,
+  data: { valid?: unknown; code?: unknown } | null,
+  retryAfter: number | undefined
+): { failure: VerifyFailure; retryAfter?: number } {
+  if (status === 429) {
+    if (data?.code === 'token_quota_exhausted') return { failure: 'quota_exhausted' }
+    return retryAfter === undefined ? { failure: 'rate_limited' } : { failure: 'rate_limited', retryAfter }
+  }
+  // 401 with "valid": false is a token that was looked at and refused. The other 401 (invalid API key)
+  // has no "valid" field. 400 is a token object that is not well formed.
+  if ((status === 401 && data?.valid === false) || status === 400) return { failure: 'rejected' }
+  return { failure: 'unavailable' }
 }
 
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -766,7 +851,12 @@ export class PQAuth {
 
   // ── Private: fetch wrapper ──────────────────────────────────────────────────
 
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  // One call to the API. Resolves with whatever the server answered, whatever the status. Rejects only when
+  // no usable answer arrived: PQAuthError TIMEOUT or NETWORK_ERROR (a body that is not JSON counts as that).
+  private async send<T>(
+    path: string,
+    options: RequestInit = {}
+  ): Promise<{ ok: boolean; status: number; data: T; retryAfter?: number }> {
     const controller = new AbortController()
     const timer      = setTimeout(() => controller.abort(), this.timeout)
 
@@ -781,19 +871,14 @@ export class PQAuth {
         },
       })
 
-      const data = await res.json() as { success: boolean; error?: string } & T
-
-      if (!res.ok || !data.success) {
-        throw new PQAuthError(
-          data.error ?? `Request failed with status ${res.status}`,
-          'API_ERROR',
-          res.status
-        )
+      const data = await res.json() as T
+      return {
+        ok:         res.ok,
+        status:     res.status,
+        data,
+        retryAfter: parseRetryAfter(res.headers?.get?.('Retry-After')),
       }
-
-      return data
     } catch (err) {
-      if (err instanceof PQAuthError) throw err
       if (err instanceof Error && err.name === 'AbortError') {
         throw new PQAuthError('Request timed out', 'TIMEOUT')
       }
@@ -804,6 +889,15 @@ export class PQAuth {
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const { ok, status, data, retryAfter } =
+      await this.send<{ success: boolean; error?: string; code?: unknown } & T>(path, options)
+
+    if (!ok || !data?.success) throw apiError(status, data, retryAfter)
+
+    return data
   }
 
   // ── Private: public key with cache ──────────────────────────────────────────
@@ -820,13 +914,19 @@ export class PQAuth {
 
     try {
       const res  = await fetch(`${this.baseUrl}/public-key`, { signal: controller.signal, headers: { 'X-API-Key': this.apiKey } })
-      if (!res.ok) throw new PQAuthError(`Failed to fetch public key: ${res.status}`, 'NETWORK_ERROR', res.status)
+      if (!res.ok) {
+        throw new PQAuthError(
+          `Failed to fetch public key: ${res.status}`, 'NETWORK_ERROR', res.status,
+          { retryAfter: parseRetryAfter(res.headers?.get?.('Retry-After')) }
+        )
+      }
       const data = await res.json() as { publicKey: string }
       if (!data.publicKey) throw new PQAuthError('Public key response missing publicKey field', 'NETWORK_ERROR')
 
       this.cachedKey = { publicKey: data.publicKey, fetchedAt: now, ttlSeconds: this.keyTTL }
       return data.publicKey
     } catch (err) {
+      if (err instanceof PQAuthError && err.status !== undefined) throw err   // the failed answer above, as it is
       if (err instanceof Error && err.name === 'AbortError') {
         throw new PQAuthError('Public key fetch timed out', 'TIMEOUT')
       }
@@ -865,7 +965,11 @@ export class PQAuth {
   /**
    * Verify a PQAuth token.
    *
-   * Never throws — returns { valid: false, error } on failure.
+   * Never throws — returns { valid: false, error, failure } on failure.
+   *
+   * `failure` tells a token that was refused ('rejected') from a check that could not be done
+   * ('rate_limited', 'quota_exhausted', 'unavailable'; see VerifyFailure). Decide on `failure`, not on
+   * the text of `error`. Only 'rejected' means the token is bad.
    *
    * If localVerify: true, verification happens entirely in memory (~1ms, no API call).
    * Local verification does not check the revocation list — use remote verification
@@ -875,8 +979,9 @@ export class PQAuth {
    * Use mandate.verify() for those.
    *
    * @example
-   * const { valid, payload } = await pqauth.verify(token)
-   * if (!valid) return res.status(401).json({ error: 'Unauthorized' })
+   * const { valid, payload, failure, retryAfter } = await pqauth.verify(token)
+   * if (!valid && failure === 'rejected') return res.status(401).json({ error: 'Unauthorized' })
+   * if (!valid) return res.status(503).set('Retry-After', String(retryAfter ?? 5)).json({ error: 'Try again' })
    */
   async verify(token: PQToken): Promise<VerifyResult> {
     return this.localVerify ? this.verifyLocal(token) : this.verifyRemote(token)
@@ -884,14 +989,24 @@ export class PQAuth {
 
   private async verifyRemote(token: PQToken): Promise<VerifyResult> {
     try {
-      const data = await this.request<{ payload: TokenPayload }>('/verify', {
+      const { ok, status, data, retryAfter } = await this.send<{
+        success?: boolean; valid?: boolean; error?: string; code?: unknown; payload?: TokenPayload
+      } | null>('/verify', {
         method: 'POST',
         body:   JSON.stringify({ token }),
       })
-      return { valid: true, payload: data.payload, local: false }
+      if (ok && data?.success) return { valid: true, payload: data.payload as TokenPayload, local: false }
+      return {
+        valid:   false,
+        payload: null,
+        error:   data?.error ?? `Request failed with status ${status}`,
+        local:   false,
+        ...classifyVerifyFailure(status, data, retryAfter),
+      }
     } catch (err) {
+      // No answer arrived (timeout, network, a body that is not JSON): the token was not checked.
       const message = err instanceof PQAuthError ? err.message : 'Unknown error'
-      return { valid: false, payload: null, error: message, local: false }
+      return { valid: false, payload: null, error: message, local: false, failure: 'unavailable' }
     }
   }
 
@@ -908,11 +1023,17 @@ private async verifyLocal(token: PQToken): Promise<VerifyResult> {
         const publicKey = await this.getPublicKey()
         const payload   = verifyLocally(token, publicKey, this.projectId!)
         return { valid: true, payload, local: true }
-      } catch { /* Still invalid after key refresh — genuinely bad token */ }
+      } catch (retryErr) {
+        // The key could not be refreshed, so it is not known whether the token is bad: say that, not "invalid".
+        if (isNoAnswer(retryErr)) return noAnswerResult(retryErr)
+        /* Still invalid after key refresh — genuinely bad token */
+      }
     }
-    // All errors reach here: INVALID_SIGNATURE (post-retry), TOKEN_EXPIRED, ISSUER_MISMATCH, etc.
+    // The public key could not be fetched: nothing was checked.
+    if (isNoAnswer(err)) return noAnswerResult(err)
+    // All other errors reach here: INVALID_SIGNATURE (post-retry), TOKEN_EXPIRED, ISSUER_MISMATCH, etc.
     const message = err instanceof PQAuthError ? err.message : 'Unknown error'
-    return { valid: false, payload: null, error: message, local: true }
+    return { valid: false, payload: null, error: message, local: true, failure: 'rejected' }
   }
 }
 
@@ -1436,6 +1557,13 @@ getCrl: async (): Promise<CaGetCrlResult> => {
   /**
    * Express / Fastify middleware. Node.js only.
    *
+   * Answers 401 only when the token is refused (`failure: 'rejected'`), or when the Authorization
+   * header is missing or not a token. When FIPSign could not check the token (rate limit, quota,
+   * timeout, network, server error, invalid API key) it answers 503 with
+   * `{ error: 'Authentication service temporarily unavailable' }`, plus a `Retry-After` header
+   * when the wait is known, so the user is not logged out for something that is not their fault.
+   * To log the real cause, call verify() yourself and read `error` and `failure`.
+   *
    * @example
    * app.use('/api', pqauth.middleware())
    */
@@ -1463,7 +1591,12 @@ getCrl: async (): Promise<CaGetCrlResult> => {
 
       const result = await this.verify(token)
       if (!result.valid) {
-        return res.status(401).json({ error: result.error ?? 'Invalid token' })
+        if (result.failure === undefined || result.failure === 'rejected') {
+          return res.status(401).json({ error: result.error ?? 'Invalid token' })
+        }
+        // FIPSign could not check the token: it is not to blame, so not a 401 (the app would log the user out).
+        if (result.retryAfter !== undefined) res.setHeader?.('Retry-After', String(result.retryAfter))
+        return res.status(503).json({ error: 'Authentication service temporarily unavailable' })
       }
 
       req.user = result.payload!
