@@ -86,6 +86,19 @@ if (check.failure === 'outcome_unknown') {
 
 The SDK never repeats a call by itself: FIPSign does not recognise a repeated request. Details: Mandate 02c in the [guide](https://fipsign.dev/guide).
 
+## Check the revocation list of your CA
+
+`ca.getCrl()` returns the certificates your CA has revoked, and the list is signed by the CA (ML-DSA-65). `ca.verifyCrl()` checks that signature offline, so a list that was altered on the way, or that belongs to another CA, is not taken as good:
+
+```typescript
+const list  = await fipsign.ca.getCrl()
+const check = await fipsign.ca.verifyCrl(list, rootCert)  // the CA_ROOT you saved when the CA was created (a PEM string for an X.509 CA)
+if (!check.valid) throw new Error(check.error)
+if (fipsign.ca.isCertRevoked(cert, list.crl)) throw new Error('revoked')
+```
+
+The signature covers `generatedAt`, so an old list cannot pass as a new one, but a correctly signed old list is still valid: `check.generatedAt` tells you when it was made, and how old a list you accept is up to you. Details: the CA chapter of the [guide](https://fipsign.dev/guide).
+
 ---
 
 ## Why ML-DSA-65?

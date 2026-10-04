@@ -10,8 +10,8 @@
  *   node test-sdk.mjs
  *
  * Optional:
- *   FIPSIGN_ROOT_CERT_JSON="$(cat root-cert.json)"  — enables offline verifyCert() tests (PQCert CA)
- *   FIPSIGN_ROOT_CERT_PEM="$(cat root-cert.pem)"   — enables offline verifyX509Cert() tests (X.509 CA)
+ *   FIPSIGN_ROOT_CERT_JSON="$(cat root-cert.json)"  — enables offline verifyCert() and verifyCrl() tests (PQCert CA)
+ *   FIPSIGN_ROOT_CERT_PEM="$(cat root-cert.pem)"   — enables offline verifyX509Cert() and verifyCrl() tests (X.509 CA)
  *
  * Token cost: ~29 tokens per run.
  *   Includes 2 expiry tests that sign a token with expiresInSeconds:60 and wait 62 seconds each.
@@ -818,7 +818,7 @@ async function run() {
 
   // 16.6 ca.getCrl() — before revocation
   // The SDK normalizes getCrl() response — r.crl is always a flat CrlEntry[].
-  // Detect X.509 via r.raw (only present for X.509 CAs).
+  // r.raw is the full signed list (both CA formats); its `format` says which kind of CA this is.
   let crlBefore
   try {
     const r = await pq.ca.getCrl()
@@ -827,14 +827,13 @@ async function run() {
     if (!r.subject)                        throw new Error('missing subject')
     if (!Array.isArray(r.crl))             throw new Error('crl is not an array')
 
-    const isX509 = r.raw !== undefined
-    if (isX509 && !r.raw.signature) throw new Error('X.509 CRL missing signature in raw')
+    if (!r.raw || !r.raw.signature) throw new Error('the signed list is missing from raw')
 
     log('caId',        r.caId)
     log('subject',     r.subject)
     log('crl entries', String(r.crl.length))
-    log('format',      isX509 ? 'x509 (signed CRL)' : 'pqcert')
-    if (isX509) log('signature', r.raw.signature.slice(0, 16) + '...')
+    log('format',      r.raw.format + ' (signed list)')
+    log('signature',   r.raw.signature.slice(0, 16) + '...')
 
     crlBefore = r.crl
     pass('ca.getCrl() — CRL returned with correct normalized shape')
@@ -910,7 +909,7 @@ async function run() {
   }
 
   // 16.12 ca.getCrl() — after revocation
-  let crlAfter
+  let crlAfter, crlAfterList
   try {
     const r = await pq.ca.getCrl()
     if (!Array.isArray(r.crl)) throw new Error('crl is not an array')
@@ -923,8 +922,28 @@ async function run() {
     }
     log('crl entries after revocation', String(r.crl.length))
     crlAfter = r.crl
+    crlAfterList = r
     pass('ca.getCrl() after revocation — CRL fetched, reason field is string or null')
   } catch (err) { fail('ca.getCrl() after revocation', err) }
+
+  // 16.12b ca.verifyCrl() — optional (requires FIPSIGN_ROOT_CERT_JSON or FIPSIGN_ROOT_CERT_PEM, as 16.5)
+  if (ROOT_CERT_JSON || ROOT_CERT_PEM) {
+    try {
+      if (!crlAfterList) throw new Error('skipped — previous steps failed')
+      const root = crlAfterList.raw.format === 'x509' ? ROOT_CERT_PEM : ROOT_CERT_JSON
+      if (!root) throw new Error('no root certificate for this kind of CA (' + crlAfterList.raw.format + ')')
+      const ok = await pq.ca.verifyCrl(crlAfterList, root)
+      if (!ok.valid) throw new Error('the list did not verify: ' + ok.error)
+      if (Math.abs(Date.now() / 1000 - ok.generatedAt) > 120) throw new Error('generatedAt is not recent: ' + ok.generatedAt)
+      const hidden = { ...crlAfterList.raw, revokedCerts: crlAfterList.raw.revokedCerts.filter(e => e.certId !== issuedCertId) }
+      const bad = await pq.ca.verifyCrl(hidden, root)
+      if (bad.valid) throw new Error('the same list without the revocation must not verify')
+      log('generatedAt', new Date(ok.generatedAt * 1000).toISOString())
+      pass('ca.verifyCrl() — the signed list verifies with the root; without the revocation it does not')
+    } catch (err) { fail('ca.verifyCrl()', err) }
+  } else {
+    console.log('  ' + DIM + '  → ca.verifyCrl() tests skipped (no FIPSIGN_ROOT_CERT_JSON / FIPSIGN_ROOT_CERT_PEM)' + RESET)
+  }
 
   // 16.13 ca.isCertRevoked() — after revocation
   try {

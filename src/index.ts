@@ -233,7 +233,31 @@ export interface CaGetCrlResult {
   subject:     string
   crl:         CrlEntry[]
   generatedAt: number
-  raw?:        Record<string, unknown>  // x509 only: full signed CRL object with ML-DSA-65 signature
+  raw?:        Record<string, unknown>  // the full signed list (SignedCrl), the one ca.verifyCrl() checks
+}
+
+/**
+ * The revocation list as the CA signs it: the `crl` field of the answer of GET /ca/crl, kept in `raw` by ca.getCrl().
+ * The signature is ML-DSA-65 over the canonical JSON of this object without `signature` (keys sorted at every level).
+ */
+export interface SignedCrl {
+  caId:         string
+  subject:      string
+  format:       'pqcert' | 'x509'
+  algorithm:    'ML-DSA-65'
+  generatedAt:  number
+  revokedCerts: CrlEntry[]
+  signature:    string  // base64
+}
+
+export interface VerifyCrlResult {
+  valid:        boolean
+  /**
+   * Unix time (seconds) at which the CA generated and signed the list. Only when `valid`. The signature covers it, so it
+   * cannot be moved forward: how old a list you are willing to accept is up to you (`Date.now() / 1000 - generatedAt`).
+   */
+  generatedAt?: number
+  error?:       string
 }
 
 export interface VerifyCertResult {
@@ -645,6 +669,100 @@ function verifyCertLocally(cert: PQCert, rootCert: PQCert): void {
       'INVALID_CERT_SIGNATURE'
     )
   }
+}
+
+// ─── Local revocation list verification ──────────────────────────────────────
+
+function crlFail(message: string, code: string): never {
+  throw new PQAuthError(message, code)
+}
+
+// The ML-DSA-65 public key inside the PEM root certificate of an X.509 CA (the same extraction ca.verifyX509Cert() does).
+async function x509RootPublicKey(rootPem: string): Promise<Uint8Array> {
+  const { AsnConvert }  = await import('@peculiar/asn1-schema')
+  const { Certificate } = await import('@peculiar/asn1-x509')
+  const der  = fromBase64(rootPem.replace(/-----[^-]+-----/g, '').replace(/\s/g, ''))
+  const root = AsnConvert.parse(der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength), Certificate)
+
+  const OID_ML_DSA_65 = '2.16.840.1.101.3.4.3.18'
+  if (root.signatureAlgorithm.algorithm !== OID_ML_DSA_65) {
+    crlFail(`Unsupported root CA algorithm: ${root.signatureAlgorithm.algorithm}. Expected ML-DSA-65 (${OID_ML_DSA_65})`, 'UNSUPPORTED_ALGORITHM')
+  }
+  const spkiRaw = new Uint8Array(root.tbsCertificate.subjectPublicKeyInfo.subjectPublicKey)
+  if (spkiRaw.length === 1952) return spkiRaw
+  if (spkiRaw.length === 1953 && spkiRaw[0] === 0x00) return spkiRaw.slice(1)  // skip the unused-bits byte
+  return crlFail(`Unexpected public key size: ${spkiRaw.length} bytes (expected 1952 or 1953 for ML-DSA-65)`, 'INVALID_ROOT')
+}
+
+// Throws a PQAuthError unless `input` is a list signed by the CA whose root is `root`. Returns the signed generatedAt.
+async function verifyCrlLocally(input: CaGetCrlResult | SignedCrl, root: PQCert | string): Promise<number> {
+  if (input === null || typeof input !== 'object') {
+    crlFail('Expected the result of ca.getCrl() or the signed list (the crl object of GET /ca/crl)', 'INVALID_CRL')
+  }
+  const obj = input as unknown as Record<string, unknown>
+
+  // The signed object: the list itself (the REST answer's `crl` field), or the `raw` of a ca.getCrl() result.
+  let signed: Record<string, unknown>
+  if (typeof obj.signature === 'string') {
+    signed = obj
+  } else if (obj.raw !== null && typeof obj.raw === 'object' && typeof (obj.raw as Record<string, unknown>).signature === 'string') {
+    signed = obj.raw as Record<string, unknown>
+    // What the caller reads from the result (crl, caId, subject, generatedAt) has to be what was signed.
+    if (
+      obj.caId !== signed.caId || obj.subject !== signed.subject || obj.generatedAt !== signed.generatedAt ||
+      !Array.isArray(obj.crl) || canonicalizeForSigning(obj.crl) !== canonicalizeForSigning(signed.revokedCerts)
+    ) {
+      crlFail('The entries of this result (crl, caId, subject, generatedAt) are not the signed ones (raw)', 'CRL_MISMATCH')
+    }
+  } else {
+    return crlFail('This list is not signed: pass the result of ca.getCrl() or the signed crl object, from a FIPSign that signs the list', 'CRL_NOT_SIGNED')
+  }
+
+  if (typeof signed.caId !== 'string' || typeof signed.generatedAt !== 'number' || !Array.isArray(signed.revokedCerts)) {
+    crlFail('Malformed list: caId, generatedAt and revokedCerts are required', 'INVALID_CRL')
+  }
+  if (signed.algorithm !== 'ML-DSA-65') {
+    crlFail(`Unsupported algorithm: ${String(signed.algorithm)}. Expected ML-DSA-65`, 'UNSUPPORTED_ALGORITHM')
+  }
+
+  let publicKey: Uint8Array
+  if (signed.format === 'pqcert') {
+    if (root === null || typeof root !== 'object' || root.type !== 'CA_ROOT') {
+      crlFail('This list is from a PQCert CA: pass its CA_ROOT certificate (the object returned when the CA was created)', 'INVALID_ROOT')
+    }
+    if (signed.caId !== root.id) {
+      crlFail('This list was not issued by this CA', 'CA_MISMATCH')
+    }
+    try {
+      publicKey = fromBase64(root.publicKey)
+    } catch {
+      return crlFail('The CA_ROOT certificate has a publicKey that is not valid base64', 'INVALID_ROOT')
+    }
+  } else if (signed.format === 'x509') {
+    if (typeof root !== 'string') {
+      crlFail('This list is from an X.509 CA: pass its root certificate in PEM form (a string)', 'INVALID_ROOT')
+    }
+    try {
+      publicKey = await x509RootPublicKey(root)
+    } catch (err) {
+      if (err instanceof PQAuthError) throw err
+      return crlFail('The root certificate could not be read: pass the PEM of the CA root certificate', 'INVALID_ROOT')
+    }
+  } else {
+    return crlFail(`Unknown list format: ${String(signed.format)}`, 'INVALID_CRL')
+  }
+
+  const { signature, ...unsigned } = signed
+  let isValid = false
+  try {
+    isValid = ml_dsa65.verify(fromBase64(signature as string), new TextEncoder().encode(canonicalizeForSigning(unsigned)), publicKey)
+  } catch {
+    isValid = false   // a signature or key of the wrong size or encoding is simply not a valid signature
+  }
+  if (!isValid) {
+    crlFail('Invalid list signature — not signed by this CA', 'INVALID_CRL_SIGNATURE')
+  }
+  return signed.generatedAt as number
 }
 
 // ─── generateKeyPair ──────────────────────────────────────────────────────────
@@ -1125,9 +1243,11 @@ private async verifyLocal(token: PQToken): Promise<VerifyResult> {
    * const result = pqauth.ca.verifyCert(deviceCert, rootCert)
    * if (!result.valid) return reject(result.error)
    *
-   * @example — check revocation
-   * const { crl } = await pqauth.ca.getCrl()
-   * const revoked = pqauth.ca.isCertRevoked(deviceCert, crl)
+   * @example — check revocation (and that the list was signed by the CA)
+   * const list  = await pqauth.ca.getCrl()
+   * const check = await pqauth.ca.verifyCrl(list, rootCert)
+   * if (!check.valid) return reject(check.error)
+   * const revoked = pqauth.ca.isCertRevoked(deviceCert, list.crl)
    */
   readonly ca = {
 
@@ -1161,13 +1281,16 @@ private async verifyLocal(token: PQToken): Promise<VerifyResult> {
     /**
      * Get the Certificate Revocation List for this project's CA.
      * Free — no token cost.
+     *
+     * The list is signed by the CA (PQCert and X.509): `crl` has the entries and `raw` the whole signed object.
+     * Check the signature with ca.verifyCrl() before you trust the list.
      */
 getCrl: async (): Promise<CaGetCrlResult> => {
   const data = await this.request<Record<string, unknown>>('/ca/crl')
   const rawCrl = data.crl
 
-  // X.509 CA: backend returns crl as a signed object with revokedCerts array
-  // PQCert CA: backend returns crl as a flat CrlEntry array
+  // The answer carries `crl` as the signed object {caId, subject, format, algorithm, generatedAt, revokedCerts, signature}:
+  // `crl` below is its revokedCerts, and `raw` keeps the whole object for ca.verifyCrl().
   if (rawCrl && !Array.isArray(rawCrl) && typeof rawCrl === 'object') {
     const obj = rawCrl as Record<string, unknown>
     return {
@@ -1179,7 +1302,7 @@ getCrl: async (): Promise<CaGetCrlResult> => {
     }
   }
 
-  // PQCert — already flat
+  // A plain array of entries (no signature): there is no `raw`, and ca.verifyCrl() says the list is not signed.
   return {
     caId:        (data.caId        as string) ?? '',
     subject:     (data.subject     as string) ?? '',
@@ -1219,6 +1342,34 @@ getCrl: async (): Promise<CaGetCrlResult> => {
     isCertRevoked: (certOrId: PQCert | string, crl: CrlEntry[]): boolean => {
       const id = typeof certOrId === 'string' ? certOrId : certOrId.id
       return crl.some(entry => entry.certId === id)
+    },
+
+    /**
+     * Check that a revocation list was signed by this CA. Offline: no API call, ML-DSA-65 locally.
+     *
+     * Pass the result of ca.getCrl() (or the signed `crl` object of the REST answer) and the root certificate of the CA:
+     * the CA_ROOT object of a PQCert CA, or the PEM string of an X.509 CA. When `valid` is true, the list is exactly what
+     * the CA signed at `generatedAt`: nobody hid, added or changed a revocation, and it is not a list of another CA.
+     * When you pass the result of ca.getCrl(), it also has to be the signed list (what you read from `crl` is what was signed).
+     *
+     * The signature covers `generatedAt`, so an old list cannot pass as a new one, but an old list that was signed is
+     * still valid: decide how old a list you accept (`Date.now() / 1000 - result.generatedAt`).
+     * It does not check the expiry of the root: ca.verifyCert() and ca.verifyX509Cert() do that for certificates.
+     *
+     * Never throws — returns { valid: false, error } on any failure.
+     *
+     * @example
+     * const list  = await pqauth.ca.getCrl()
+     * const check = await pqauth.ca.verifyCrl(list, rootCert)
+     * if (!check.valid) return reject(check.error)
+     * const revoked = pqauth.ca.isCertRevoked(deviceCert, list.crl)
+     */
+    verifyCrl: async (crl: CaGetCrlResult | SignedCrl, root: PQCert | string): Promise<VerifyCrlResult> => {
+      try {
+        return { valid: true, generatedAt: await verifyCrlLocally(crl, root) }
+      } catch (err) {
+        return { valid: false, error: err instanceof Error ? err.message : 'Unknown error' }
+      }
     },
 
     /**
