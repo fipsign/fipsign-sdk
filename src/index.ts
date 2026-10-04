@@ -322,9 +322,35 @@ export type MandateDenyReason =
   | 'agent_signature_mismatch'
   | 'agent_signature_replayed'
 
+/**
+ * Why mandate.verify() answered `result: 'denied'`. The values of VerifyFailure, plus `'outcome_unknown'`.
+ *
+ * - `'rejected'`        FIPSign looked at the call and refused it (`reason` says why: scope, budget, expired, revoked,
+ *                       suspended, agent signature...) or the request was not well formed. Nothing was consumed.
+ * - `'rate_limited'`    Your API key sent too many requests in the current minute. Nothing was consumed:
+ *                       wait `retryAfter` seconds and try again.
+ * - `'quota_exhausted'` Your free tokens and your packs are used up. Nothing was consumed (the mandate budget is given
+ *                       back) and waiting does not help: buy a pack from the dashboard.
+ * - `'unavailable'`     FIPSign answered but could not check the call (for example, an invalid API key). Nothing was consumed.
+ * - `'outcome_unknown'` NO usable answer arrived: timeout, network failure, an answer that could not be read, or a server
+ *                       error. FIPSign may have granted the call, used up its budget and charged its tokens without you
+ *                       ever hearing about it. Do not act as if it was granted and do not send it again blindly: with
+ *                       `agentSignature`, send the SAME call again while the signature is still valid (`granted` = it is
+ *                       applied now, once; `agent_signature_replayed` = it was applied the first time); without one, compare
+ *                       `budgetConsumed` of mandate.get(id) with the value you had before. See Mandate 02c in the guide.
+ *
+ * Decide on `failure`, not on the text of `reason`. A call that was not granted is always `result: 'denied'`, so code
+ * that only checks `result !== 'granted'` keeps working: it never acts on a call that may not have been granted.
+ */
+export type MandateVerifyFailure = VerifyFailure | 'outcome_unknown'
+
 export interface MandateVerifyResult {
   result:               'granted' | 'denied'
   reason?:              MandateDenyReason | (string & {})
+  /** Why `result` is 'denied'. Absent when granted. See MandateVerifyFailure. */
+  failure?:             MandateVerifyFailure
+  /** Seconds to wait before trying again. Only present with `failure: 'rate_limited'`. */
+  retryAfter?:          number
   actionMatched?:       string
   budgetRemaining?:     number
   expiresInSeconds?:    number
@@ -461,6 +487,20 @@ function classifyVerifyFailure(
   // has no "valid" field. 400 is a token object that is not well formed.
   if ((status === 401 && data?.valid === false) || status === 400) return { failure: 'rejected' }
   return { failure: 'unavailable' }
+}
+
+// What a POST /mandate/verify answer that is not "granted" means. FIPSign consumes nothing on a denial (403), a malformed
+// request (400), an invalid API key (401), an unsupported content type (415) or a 429, so any other 4xx is the same.
+// Anything else (a 5xx, or a status that should not happen) may have come after the call was applied: 'outcome_unknown'.
+function classifyMandateVerifyFailure(
+  status: number,
+  data: { result?: unknown; code?: unknown } | null,
+  retryAfter: number | undefined
+): { failure: MandateVerifyFailure; retryAfter?: number } {
+  if (status === 429) return classifyVerifyFailure(status, data, retryAfter)
+  if (data?.result === 'denied' || status === 400) return { failure: 'rejected' }
+  if (status >= 400 && status < 500) return { failure: 'unavailable' }
+  return { failure: 'outcome_unknown' }
 }
 
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -1370,12 +1410,19 @@ getCrl: async (): Promise<CaGetCrlResult> => {
      * right now — signature, expiry, status, scope, and remaining budget,
      * all in one atomic server-side check.
      *
-     * Never throws — returns { result: 'denied', reason } on any failure
+     * Never throws — returns { result: 'denied', reason, failure } on any failure
      * (invalid signature, expired, suspended, revoked, action not in
-     * scope, budget exhausted, or a missing/invalid agent signature). Billed (at the
-     * platform price of POST /mandate/verify) only when the result is 'granted' — a denied
-     * check is always free. `reason` is one of MandateDenyReason, or the real error message
-     * for failures that never reach the mandate checks (invalid API key, rate limit, network).
+     * scope, budget exhausted, a missing/invalid agent signature, or a call that got no
+     * usable answer). Billed (at the platform price of POST /mandate/verify) only when the
+     * result is 'granted' — a denial from FIPSign is always free. `reason` is one of
+     * MandateDenyReason, or the real error message for failures that never reach the mandate
+     * checks (invalid API key, rate limit, network).
+     *
+     * `failure` tells a denial FIPSign decided ('rejected', 'rate_limited', 'quota_exhausted',
+     * 'unavailable': nothing was consumed, repeating the call is safe) from
+     * 'outcome_unknown' (timeout, network, server error: the call MAY have been granted and
+     * charged; see MandateVerifyFailure for what to do). Decide on `failure`, not on `reason`.
+     * The SDK never repeats a call by itself: FIPSign does not recognise a repeated request.
      *
      * If the mandate was emitted with `agentPublicKey`, pass the agent's signature (made with
      * signAgentCall) in `options.agentSignature`. It covers this exact mandate, action and
@@ -1392,6 +1439,10 @@ getCrl: async (): Promise<CaGetCrlResult> => {
     verify: async (token: PQToken, action: string, cost: number, options?: MandateVerifyOptions): Promise<MandateVerifyResult> => {
       const controller = new AbortController()
       const timer      = setTimeout(() => controller.abort(), this.timeout)
+      // Set as soon as FIPSign's answer starts to arrive: the status alone tells whether the call could have been
+      // applied, even when the body that follows cannot be read.
+      let status:     number | undefined
+      let retryAfter: number | undefined
       try {
         const res = await fetch(`${this.baseUrl}/mandate/verify`, {
           method:  'POST',
@@ -1399,27 +1450,40 @@ getCrl: async (): Promise<CaGetCrlResult> => {
           headers: { 'Content-Type': 'application/json', 'X-API-Key': this.apiKey },
           body:    JSON.stringify({ token, action, cost, ...(options?.agentSignature ? { agentSignature: options.agentSignature } : {}) }),
         })
+        status     = res.status
+        retryAfter = parseRetryAfter(res.headers?.get?.('Retry-After'))
         // Deliberately NOT using this.request() here: a 'denied' result is
         // a normal, expected outcome carrying real data (reason,
         // authorizedScope, budgetConsumedUnits, budgetTotalUnits) in a
         // 403 response — not an error to discard. request() only forwards
         // a generic `error` field on failure, which this endpoint doesn't
         // use, so those fields would be lost if we let it throw.
-        const data = await res.json() as MandateVerifyResult & { success?: boolean; error?: string }
-        if (data.result === 'granted' || data.result === 'denied') return data
+        const data = await res.json() as (MandateVerifyResult & { success?: boolean; error?: string; code?: unknown }) | null
+        if (data?.result === 'granted') return data
+        if (data?.result === 'denied')  return { ...data, failure: 'rejected' }
         // Failures that never reach mandate-specific logic (invalid/missing
         // API key, rate limit, malformed body) come back through the
         // generic errorResponse() shape — { success:false, error } — with
         // no `result` field at all. Normalize those into the same denied
         // shape instead of silently dropping the real error message.
-        return { result: 'denied', reason: data.error ?? `Request failed with status ${res.status}` }
-      } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          return { result: 'denied', reason: 'Request timed out' }
-        }
         return {
           result: 'denied',
-          reason: `Network error: ${err instanceof Error ? err.message : 'unknown'}`,
+          reason: data?.error ?? `Request failed with status ${res.status}`,
+          ...classifyMandateVerifyFailure(res.status, data, retryAfter),
+        }
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          // No usable answer: the call may have been applied.
+          return { result: 'denied', reason: 'Request timed out', failure: 'outcome_unknown' }
+        }
+        // `status` is set only when an answer did start to arrive (its body was not JSON, or broke off): its status
+        // still tells whether the call could have been applied. Without it, no answer arrived at all.
+        return {
+          result: 'denied',
+          reason: err instanceof SyntaxError && status !== undefined
+            ? `Request failed with status ${status}`
+            : `Network error: ${err instanceof Error ? err.message : 'unknown'}`,
+          ...(status === undefined ? { failure: 'outcome_unknown' as const } : classifyMandateVerifyFailure(status, null, retryAfter)),
         }
       } finally {
         clearTimeout(timer)

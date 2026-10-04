@@ -62,6 +62,30 @@ if (!valid) return res.status(503).set('Retry-After', String(retryAfter ?? 5)).e
 
 `fipsign.middleware()` (Express / Fastify) does this for you: 401 for a refused token, 503 (with `Retry-After` when known) for the rest.
 
+## When mandate.verify() says no
+
+`mandate.verify()` never throws either. When `result` is `'denied'`, `failure` says whether FIPSign decided or the answer never arrived:
+
+| `failure` | Meaning | Anything consumed? | What to do |
+|---|---|---|---|
+| `'rejected'` | FIPSign refused the call; `reason` says why (scope, budget, expired, revoked, suspended, agent signature, ...) | No | Do not act |
+| `'rate_limited'` | Too many requests in the current minute | No | Wait `retryAfter` seconds and try again |
+| `'quota_exhausted'` | Free tokens and packs used up | No | Buy a pack from the dashboard |
+| `'unavailable'` | FIPSign answered but could not check the call (for example, an invalid API key) | No | Do not act; fix the cause |
+| `'outcome_unknown'` | No usable answer (timeout, network, server error). The call may have been granted and charged | Maybe | Do not act on it and do not repeat it blindly (below) |
+
+```typescript
+const check = await fipsign.mandate.verify(token, 'send_email', 1, { agentSignature })
+if (check.result === 'granted') return sendEmail()
+if (check.failure === 'outcome_unknown') {
+  // With an agentSignature: send the SAME call again while the signature is still valid.
+  //   granted = it is applied now, once; agent_signature_replayed = it was applied the first time (do the action).
+  // Without one: compare budgetConsumed of mandate.get(id) with the value you had before the call.
+}
+```
+
+The SDK never repeats a call by itself: FIPSign does not recognise a repeated request. Details: Mandate 02c in the [guide](https://fipsign.dev/guide).
+
 ---
 
 ## Why ML-DSA-65?
