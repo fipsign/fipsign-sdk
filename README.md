@@ -86,6 +86,63 @@ if (check.failure === 'outcome_unknown') {
 
 The SDK never repeats a call by itself: FIPSign does not recognise a repeated request. Details: Mandate 02c in the [guide](https://fipsign.dev/guide).
 
+## Prove what an agent was allowed to do
+
+FIPSign keeps a log of everything that happens to a mandate (emitted, each call it granted or denied, narrowed, suspended, resumed, revoked) and signs it. Pass your own id as `correlationId` (a ticket, a request id) to find an event later, and ask for a **receipt** on the calls you may have to prove:
+
+```typescript
+const { mandate, receipt } = await fipsign.mandate.emit({ /* ... */, correlationId: 'ticket-4821' })
+const check = await fipsign.mandate.verify(mandate.token, 'send_reply', 1, { receipt: true, correlationId: 'req-77' })  // check.receipt
+const done  = await fipsign.mandate.revoke(mandate.id, { correlationId: 'ticket-4822' })                                // done.receipt
+```
+
+`emit()` and the changes (`narrow`, `suspend`, `resume`, `revoke`) always return a receipt; `verify()` returns one when you pass `receipt: true`, granted or denied. Keep it next to your own record. It is FIPSign's signature over that event and over everything the log held before it, so the history cannot be rewritten later without the receipt showing it. Check it on your own machine, with no network:
+
+```typescript
+import { publicKeyFingerprint, verifyMandateReceipt } from 'fipsign-sdk'
+
+// Once, the day you integrate. `publicKey` is the answer of:  curl -H "X-API-Key: pqa_your_api_key" https://api.fipsign.dev/public-key
+// Save it (or just its fingerprint):
+const fingerprint = await publicKeyFingerprint(publicKey)
+
+// Any day later:
+const { valid, problems } = await verifyMandateReceipt(receipt, { publicKey })
+if (!valid) console.error(problems)
+```
+
+A project that rotated its keys has more than one: a receipt is checked with the key that made it. Pin the fingerprint you saved and let `mandate.publicKeys()` (every key the project has had, the retired ones too) supply the keys; a key is accepted only if its own fingerprint is the one you pinned:
+
+```typescript
+const { keys } = await fipsign.mandate.publicKeys()
+const { valid, problems } = await verifyMandateReceipt(receipt, { pinFingerprint: fingerprint, keys })
+```
+
+Read the log, one mandate or the whole project:
+
+```typescript
+for await (const e of fipsign.mandate.eventsAll(mandate.id)) console.log(e.seq, e.type, JSON.parse(e.body))
+const { events } = await fipsign.mandate.queryEvents({ correlationId: 'ticket-4821' })       // also: type, action, keyId, traceId, from, to
+for await (const e of fipsign.mandate.queryEventsAll({ type: 'verify_denied' })) console.log(e.mandateId, e.at)
+```
+
+Export the whole log of a mandate and check it, with no network:
+
+```typescript
+import { verifyMandateExport } from 'fipsign-sdk'
+
+const pages = await fipsign.mandate.exportAll(mandate.id)
+const check = await verifyMandateExport(pages, { pinFingerprint: fingerprint })   // or { publicKey }
+console.log(check.valid, check.complete, check.problems)
+```
+
+| Field | Meaning |
+|---|---|
+| `valid` | Every event follows the one before it and is what it says it is, and every signature that is in the export verifies. `problems` lists what does not |
+| `complete` | The log starts at event 1 and ends in a checkpoint that seals everything before it. A log that is `valid` but not `complete` has events at its end that only the signed head (or a receipt you hold) protects |
+| `keyTrust` | `'pinned'`: the key was fixed by you (`publicKey` or `pinFingerprint`). `'fipsign'`: you gave neither, so the keys came from FIPSign (`mandate.verifyReceipt()` and `mandate.verifyExport()` only): that detects a log that was altered, but not a key that FIPSign itself replaced |
+
+`verifyMandateReceipt()` and `verifyMandateExport()` never throw and need no API key. A signature proves what FIPSign recorded and when; it does not prove that your service made the request. Events are kept for 365 days.
+
 ## Check the revocation list of your CA
 
 `ca.getCrl()` returns the certificates your CA has revoked, and the list is signed by the CA (ML-DSA-65). `ca.verifyCrl()` checks that signature offline, so a list that was altered on the way, or that belongs to another CA, is not taken as good:

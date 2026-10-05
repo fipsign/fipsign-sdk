@@ -307,6 +307,11 @@ export interface MandateEmitOptions {
    * never reaches FIPSign. Without it the mandate is a plain bearer token.
    */
   agentPublicKey?:  string
+  /**
+   * Your own id for this call (a ticket, a request id): 1 to 128 characters, no control characters. It is written inside the
+   * audit event, so the receipt covers it, and you can find the event with it (mandate.queryEvents).
+   */
+  correlationId?:   string
 }
 
 export interface MandateEmitResult {
@@ -328,6 +333,8 @@ export interface MandateEmitResult {
     totalRemaining: number
     month:          string
   }
+  /** FIPSign's signature over the event "emitted" of this mandate. Keep it: see MandateReceipt. */
+  receipt?: MandateReceipt
 }
 
 /**
@@ -387,11 +394,20 @@ export interface MandateVerifyResult {
     totalRemaining: number
     month:          string
   }
+  /** Only with `receipt: true` in the options, and only when FIPSign recorded the call (granted, or denied by a mandate check). */
+  receipt?: MandateReceipt
 }
 
 export interface MandateVerifyOptions {
   /** Required when the mandate was emitted with `agentPublicKey`. Made by signAgentCall(); single use. */
   agentSignature?: PQToken
+  /**
+   * `true` asks FIPSign for its signature over the event this call produced (`receipt` in the answer), granted or denied.
+   * Signing takes a little time, so it is off by default: ask for it on the calls you may have to prove later.
+   */
+  receipt?: boolean
+  /** Your own id for this call: written inside the audit event, so the receipt covers it, and usable as a filter (mandate.queryEvents). */
+  correlationId?: string
 }
 
 export interface MandatePatchResult {
@@ -401,6 +417,8 @@ export interface MandatePatchResult {
   updatedAt?: number
   /** Only present when suspend() is called on an already-suspended mandate. */
   message?:   string
+  /** FIPSign's signature over the event this change produced. Keep it: see MandateReceipt. Absent when nothing changed. */
+  receipt?:   MandateReceipt
 }
 
 export interface MandateGetResult {
@@ -420,6 +438,232 @@ export interface MandateListResult {
   count:      number
   /** Pass it as `cursor` to get the next page. null on the last page. */
   nextCursor: string | null
+}
+
+// ─── Mandate audit types: events, receipts, export ────────────────────────────
+
+/** What can be recorded about a mandate. The audit log keeps one event per occurrence. */
+export type MandateEventType =
+  | 'emitted'
+  | 'verify_granted'
+  | 'verify_denied'
+  | 'verify_released'
+  | 'narrowed'
+  | 'suspended'
+  | 'resumed'
+  | 'revoked'
+  | 'chain_started'
+  | 'checkpoint'
+  | 'log_limit_reached'
+
+/**
+ * One entry of the audit log of a mandate. Entries are chained: `hash` is the SHA-256 (lowercase hex) of
+ * `prevHash + "\n" + body`, where `prevHash` is the `hash` of the entry before it (64 zeros for the first).
+ * `body` is a string: the exact text that was hashed (canonical JSON). Parse it to read the event; never re-serialize it.
+ */
+export interface MandateEvent {
+  seq:      number
+  type:     MandateEventType | (string & {})
+  /** Unix seconds. */
+  at:       number
+  prevHash: string
+  hash:     string
+  body:     string
+}
+
+/**
+ * FIPSign's signature over one event of one mandate, returned by mandate.emit(), the PATCH methods and, when you ask for
+ * it, mandate.verify(). Keep it: it commits to the whole history of the mandate up to that event, so the history cannot be
+ * rewritten later without the receipt showing it. Check it with mandate.verifyReceipt() or verifyMandateReceipt().
+ */
+export interface MandateReceipt {
+  /** The text that was signed: canonical JSON of { v, kind, projectId, mandateId, seq, hash, at }. */
+  signed:         string
+  /** Base64, ML-DSA detached signature (FIPS 204) made with the project key. */
+  signature:      string
+  algorithm:      MlDsaVariant
+  /** SHA-256 (lowercase hex) of the public key that made the signature. */
+  keyFingerprint: string
+  event:          MandateEvent
+}
+
+/** Optional input of the calls that change a mandate (narrow, suspend, resume, revoke). */
+export interface MandateChangeOptions {
+  /**
+   * Your own id for this call (a ticket, a request id): 1 to 128 characters, no control characters. It is written inside the
+   * event, so the receipt covers it, and you can find the event with it (mandate.queryEvents).
+   */
+  correlationId?: string
+}
+
+/** One public key of the project, as GET /public-keys lists it. */
+export interface MandatePublicKey {
+  /** SHA-256 (lowercase hex) of the public key bytes: the value a receipt carries as `keyFingerprint`. */
+  fingerprint: string
+  algorithm:   MlDsaVariant
+  /** Base64. */
+  publicKey:   string
+  status:      'current' | 'retired'
+  /** Unix seconds: when FIPSign wrote the key down (not when the key was made). */
+  recordedAt:  number
+  /** Unix seconds: when the project rotated it away. null for the current key and for a key retired before the history existed. */
+  retiredAt:   number | null
+}
+
+export interface MandatePublicKeysResult {
+  projectId: string
+  /** The current key first, then the retired ones, the most recently retired first. */
+  keys:      MandatePublicKey[]
+  count:     number
+}
+
+export interface MandateEventsOptions {
+  /** Return the events after this seq (0 or more). Default 0. */
+  after?: number
+  /** Page size, 1 to 500. Default 100. */
+  limit?: number
+}
+
+export interface MandateEventsResult {
+  mandateId: string
+  events:    MandateEvent[]
+  count:     number
+  /** Pass it as `after` to get the next page. null on the last page. */
+  nextAfter: number | null
+  /** The end of the chain as it is right now, or null when the mandate has no log yet. */
+  head:      { seq: number; hash: string; lastCheckpointSeq: number } | null
+}
+
+/** Filters of mandate.queryEvents(). Every one is an exact match, except the period (from <= at <= to, Unix seconds). */
+export interface MandateEventsQuery {
+  mandateId?:     string
+  type?:          MandateEventType
+  action?:        string
+  /** The id of an API key: the first 16 characters of its hash, as the dashboard lists it. */
+  keyId?:         string
+  correlationId?: string
+  /** The trace id of the W3C "traceparent" header of the call (32 lowercase hex characters). */
+  traceId?:       string
+  from?:          number
+  to?:            number
+  /** Page size, 1 to 200. Default 50. */
+  limit?:         number
+  /** The `nextCursor` of the previous page, exactly as received. */
+  cursor?:        string
+}
+
+export interface MandateProjectEvent extends MandateEvent {
+  mandateId: string
+}
+
+export interface MandateEventsQueryResult {
+  /** Newest first. */
+  events:     MandateProjectEvent[]
+  count:      number
+  /** Pass it as `cursor` to get the next page. null on the last page. */
+  nextCursor: string | null
+  from:       number | null
+  to:         number | null
+}
+
+/** The live end of the chain, signed by FIPSign at the moment of the export. Only present while the mandate is alive. */
+export interface MandateExportHead {
+  seq:               number
+  hash:              string
+  at:                number
+  source:            'live'
+  lastCheckpointSeq: number
+  signed:            string
+  signature:         string
+  algorithm:         MlDsaVariant
+  keyFingerprint:    string
+}
+
+/** One page of mandate.export(). Check the pages, in order, with mandate.verifyExport() or verifyMandateExport(). */
+export interface MandateExportPage {
+  format:      string
+  projectId:   string
+  mandateId:   string
+  generatedAt: number
+  events:      MandateEvent[]
+  count:       number
+  /** Pass it as `after` to get the next page. null on the last page. */
+  nextAfter:   number | null
+  head:        MandateExportHead | null
+  /** Every public key of the project, so a signature made before a key rotation can still be checked. */
+  publicKeys:  MandatePublicKey[]
+}
+
+export interface MandateExportOptions {
+  /** Return the events after this seq (0 or more). Default 0. */
+  after?: number
+  /** Page size, 1 to 1000. Default 500. */
+  limit?: number
+}
+
+/**
+ * Which keys to check a signature with. A signature is only as trustworthy as the key it is checked with: give a key you
+ * already trusted (a `publicKey` you saved when you integrated, or the `pinFingerprint` you saved), not one that FIPSign
+ * shows you at the moment of the check.
+ */
+export interface MandateKeyOptions {
+  /** Public key(s), base64, that you trust: what GET /public-key returned when you integrated. */
+  publicKey?:      string | string[]
+  /**
+   * Fingerprint(s) you saved (publicKeyFingerprint() of the key). The key itself is taken from `keys`, or from the export
+   * when checking one, and accepted only if its own fingerprint is the pinned one. Pin one fingerprint per key you trust.
+   */
+  pinFingerprint?: string | string[]
+  /**
+   * Candidate keys, for example the `keys` of mandate.publicKeys(): only those whose fingerprint you pinned are trusted.
+   * (mandate.verifyReceipt() and mandate.verifyExport(), when you give neither `publicKey` nor `pinFingerprint`, check with
+   * these keys, or with the ones FIPSign lists, and say `keyTrust: 'fipsign'`.)
+   */
+  keys?:           Array<string | { publicKey: string }>
+}
+
+export interface MandateReceiptCheckOptions extends MandateKeyOptions {
+  /** Fail unless the receipt is for this project / this mandate. */
+  expect?: { projectId?: string; mandateId?: string }
+}
+
+/**
+ * `'pinned'`: the key was fixed by you (`publicKey` or `pinFingerprint`): the check does not depend on FIPSign's word.
+ * `'fipsign'`: no key or fingerprint was given, so the keys came from FIPSign itself (mandate.verifyReceipt() and
+ * mandate.verifyExport() only): the check detects a receipt or a log that was altered, but cannot tell a key that FIPSign
+ * (or somebody who can write its database) replaced.
+ */
+export type MandateKeyTrust = 'pinned' | 'fipsign'
+
+export interface MandateReceiptCheck {
+  /** true only if the signature, the event and the hash all check out and nothing in `problems`. */
+  valid:      boolean
+  problems:   string[]
+  keyTrust:   MandateKeyTrust
+  projectId?: string
+  mandateId?: string
+  event?:     MandateEvent
+}
+
+export interface MandateExportCheck {
+  valid:         boolean
+  problems:      string[]
+  /** Things that are not wrong but limit what was checked (for example: the export starts at event 40). */
+  notes:         string[]
+  keyTrust:      MandateKeyTrust
+  projectId:     string
+  mandateId:     string
+  /** Events checked. */
+  events:        number
+  lastSeq:       number
+  /** Checkpoints whose signature and covered event were checked. */
+  checkpoints:   number
+  /** Every event up to this seq is sealed by a verified checkpoint. */
+  sealedThrough: number
+  /** The signed live head was there and matches the chain. */
+  headChecked:   boolean
+  /** The log starts at event 1, ends with a verified checkpoint that seals everything before it, and nothing follows. */
+  complete:      boolean
 }
 
 // ─── Middleware types ─────────────────────────────────────────────────────────
@@ -525,6 +769,22 @@ function classifyMandateVerifyFailure(
   if (data?.result === 'denied' || status === 400) return { failure: 'rejected' }
   if (status >= 400 && status < 500) return { failure: 'unavailable' }
   return { failure: 'outcome_unknown' }
+}
+
+// The optional fields the calls that change a mandate send next to their action.
+function changeFields(options: MandateChangeOptions | undefined): { correlationId?: string } {
+  return options?.correlationId !== undefined ? { correlationId: options.correlationId } : {}
+}
+
+// The query string of mandate.queryEvents(): only the filters that were given.
+function eventsQueryString(query: MandateEventsQuery | undefined): string {
+  const params = new URLSearchParams()
+  const names = ['mandateId', 'type', 'action', 'keyId', 'correlationId', 'traceId', 'from', 'to', 'limit', 'cursor'] as const
+  for (const name of names) {
+    const value = query?.[name]
+    if (value !== undefined) params.set(name, String(value))
+  }
+  return params.toString()
 }
 
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -959,6 +1219,370 @@ export async function signAgentCall(options: SignAgentCallOptions): Promise<PQTo
   } finally {
     secret?.fill(0)
   }
+}
+
+// ─── Mandate audit: check receipts and exports on your own machine ────────────
+//
+// FIPSign signs what it records about a mandate (see MandateReceipt). The functions below check those signatures and the hash
+// chain locally, with the same library that checks the other signatures of this SDK: nothing is sent anywhere and no API key is
+// needed. verifyMandateReceipt() and verifyMandateExport() never throw: whatever is wrong is listed in `problems`.
+//
+// A signature is only as trustworthy as the key it is checked with. Give them a key you already trusted (`publicKey`, the key
+// GET /public-key returned when you integrated) or its fingerprint (`pinFingerprint`, from publicKeyFingerprint()); the keys of a
+// project that has rotated its keys come with the export or from mandate.publicKeys(), and are accepted only if their own
+// fingerprint is the pinned one.
+
+const MANDATE_SIGNING_DOMAIN = 'FIPSIGN-MANDATE-v1\n'
+const MANDATE_GENESIS_HASH   = '0'.repeat(64)
+
+type JsonObject = Record<string, unknown>
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isMandateEventShape(value: unknown): value is MandateEvent {
+  return isJsonObject(value) &&
+    Number.isSafeInteger(value.seq) && Number.isSafeInteger(value.at) &&
+    typeof value.type === 'string' && typeof value.prevHash === 'string' &&
+    typeof value.hash === 'string' && typeof value.body === 'string'
+}
+
+function toList<T>(value: T | T[] | undefined): T[] {
+  return value === undefined ? [] : Array.isArray(value) ? value : [value]
+}
+
+/**
+ * The fingerprint of a public key: SHA-256, lowercase hex, of the key bytes. It is the value a receipt carries as
+ * `keyFingerprint`. Keep the fingerprint of your project's key (GET /public-key, the day you integrate) and pass it as
+ * `pinFingerprint` when you check a receipt or an export: the check then does not depend on FIPSign's word about which key is yours.
+ *
+ * @example
+ * const { publicKey } = await (await fetch('https://api.fipsign.dev/public-key', { headers: { 'X-API-Key': apiKey } })).json()
+ * console.log(await publicKeyFingerprint(publicKey))   // save this value
+ */
+export async function publicKeyFingerprint(publicKey: string): Promise<string> {
+  let bytes: Uint8Array
+  try {
+    if (typeof publicKey !== 'string' || publicKey.trim() === '') throw new Error('empty')
+    bytes = fromBase64(publicKey.trim())
+  } catch {
+    throw new PQAuthError('"publicKey" is not a valid base64 public key', 'INVALID_PUBLIC_KEY')
+  }
+  const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(bytes))
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+// The keys a check trusts: Map fingerprint -> public key (base64).
+interface MandateTrust {
+  trusted:  Map<string, string>
+  problems: string[]
+  keyTrust: MandateKeyTrust
+}
+
+// From what the caller gave: `publicKey` is trusted as it is; of the candidate keys (`keys`, plus those that come with the thing
+// being checked), only those whose own fingerprint is pinned. Without `publicKey` or `pinFingerprint`: nothing is trusted
+// (strict) or every candidate is (`fipsign`: the answer then says keyTrust 'fipsign').
+async function resolveMandateTrust(
+  options:    MandateKeyOptions | undefined,
+  candidates: unknown[],
+  fallback:   'strict' | 'fipsign'
+): Promise<MandateTrust> {
+  const opts     = options ?? {}
+  const given    = toList<unknown>(opts.publicKey).length > 0 || toList<unknown>(opts.pinFingerprint).length > 0
+  const problems: string[] = []
+  const trusted  = new Map<string, string>()
+
+  // Every key that could be used, as base64 text, with its own fingerprint (never the one a list claims for it).
+  const pool = new Map<string, string>()
+  for (const c of [...toList<unknown>(opts.keys), ...candidates]) {
+    const key = typeof c === 'string' ? c : isJsonObject(c) && typeof c.publicKey === 'string' ? c.publicKey : undefined
+    if (key === undefined || key.trim() === '') continue
+    try { pool.set(await publicKeyFingerprint(key), key.trim()) } catch { /* not a key: ignored */ }
+  }
+
+  if (!given) {
+    if (fallback === 'strict') {
+      return { trusted, keyTrust: 'pinned', problems: ['no key to trust: pass `publicKey` (the key you saved) or `pinFingerprint` (its fingerprint): a list of keys that comes from FIPSign is not trusted by itself'] }
+    }
+    return { trusted: pool, problems, keyTrust: 'fipsign' }
+  }
+
+  for (const k of toList<unknown>(opts.publicKey)) {
+    if (typeof k !== 'string' || k.trim() === '') { problems.push('`publicKey` must be a base64 public key'); continue }
+    try { trusted.set(await publicKeyFingerprint(k), k.trim()) } catch { problems.push('`publicKey` is not valid base64') }
+  }
+  const pins: string[] = []
+  for (const p of toList<unknown>(opts.pinFingerprint)) {
+    if (typeof p !== 'string' || !/^[0-9a-fA-F]{64}$/.test(p.trim())) {
+      problems.push('`pinFingerprint` must be 64 hexadecimal characters (SHA-256 of the public key)')
+      continue
+    }
+    pins.push(p.trim().toLowerCase())
+  }
+  for (const pin of pins) {
+    const key = pool.get(pin)
+    if (key !== undefined) trusted.set(pin, key)
+    else if (!trusted.has(pin)) problems.push(`no key with fingerprint ${pin} among the keys given`)
+  }
+  return { trusted, problems, keyTrust: 'pinned' }
+}
+
+// Does the signature of `seal` verify, with the key named by its fingerprint, among the trusted keys? null if it does.
+function checkMandateSeal(seal: JsonObject, trusted: Map<string, string>): string | null {
+  const { signed, signature, algorithm, keyFingerprint } = seal
+  if (typeof signed !== 'string' || typeof signature !== 'string' || typeof algorithm !== 'string' || typeof keyFingerprint !== 'string') {
+    return 'the signature is not complete: signed, signature, algorithm and keyFingerprint are needed'
+  }
+  const publicKey = trusted.get(keyFingerprint)
+  if (publicKey === undefined) return `the signing key ${keyFingerprint.slice(0, 16)}… is not one of the keys you trust`
+  let mlDsa: ReturnType<typeof getMlDsa>
+  try { mlDsa = getMlDsa(algorithm) } catch { return `unknown algorithm ${algorithm}` }
+  let ok = false
+  try {
+    ok = mlDsa.verify(fromBase64(signature), new TextEncoder().encode(MANDATE_SIGNING_DOMAIN + signed), fromBase64(publicKey))
+  } catch {
+    ok = false
+  }
+  return ok ? null : 'the signature does not verify'
+}
+
+// The statement that was signed, as an object. It must be exactly the canonical text, of the expected kind.
+function parseMandateStatement(signed: unknown, kind: string): { statement: JsonObject } | { error: string } {
+  if (typeof signed !== 'string') return { error: 'the signed statement is missing' }
+  let statement: unknown
+  try { statement = JSON.parse(signed) } catch { return { error: 'the signed statement is not JSON' } }
+  if (!isJsonObject(statement) || canonicalizeForSigning(statement) !== signed) return { error: 'the signed statement is not in canonical form' }
+  if (statement.v !== 1 || statement.kind !== kind) return { error: `the statement is not of kind ${kind}` }
+  return { statement }
+}
+
+// One event on its own: its hash is sha256(prevHash + "\n" + body) and its body says the same as its fields.
+async function checkMandateEvent(e: MandateEvent, mandateId: string | undefined): Promise<string[]> {
+  const bad: string[] = []
+  if (await sha256Hex(`${e.prevHash}\n${e.body}`) !== e.hash) bad.push(`event ${e.seq}: hash is not sha256(prevHash + "\\n" + body)`)
+  let body: unknown
+  try { body = JSON.parse(e.body) } catch { bad.push(`event ${e.seq}: body is not JSON`); return bad }
+  if (!isJsonObject(body)) { bad.push(`event ${e.seq}: body is not a JSON object`); return bad }
+  if (canonicalizeForSigning(body) !== e.body) bad.push(`event ${e.seq}: body is not canonical JSON`)
+  if (body.v !== 1 || body.seq !== e.seq || body.type !== e.type || body.at !== e.at || (mandateId && body.mandateId !== mandateId)) {
+    bad.push(`event ${e.seq}: body does not match the event`)
+  }
+  return bad
+}
+
+async function checkMandateReceipt(
+  input:   unknown,
+  trusted: Map<string, string>,
+  expect:  { projectId?: string; mandateId?: string }
+): Promise<{ problems: string[]; projectId?: string; mandateId?: string; event?: MandateEvent }> {
+  const raw = isJsonObject(input) && isJsonObject(input.receipt) ? input.receipt : input
+  if (!isJsonObject(raw) || !isMandateEventShape(raw.event)) {
+    return { problems: ['this is not a receipt: it needs signed, signature, algorithm, keyFingerprint and event'] }
+  }
+  const event    = raw.event
+  const problems: string[] = []
+  const sealErr  = checkMandateSeal(raw, trusted)
+  if (sealErr) problems.push(sealErr)
+  const parsed = parseMandateStatement(raw.signed, 'mandate.receipt')
+  if ('error' in parsed) { problems.push(parsed.error); return { problems, event } }
+  const s = parsed.statement
+  if (s.seq !== event.seq || s.hash !== event.hash || s.at !== event.at) problems.push('the signed statement is not about the event the receipt carries')
+  let body: unknown
+  try { body = JSON.parse(event.body) } catch { /* reported by checkMandateEvent */ }
+  if (!isJsonObject(body) || body.mandateId !== s.mandateId) problems.push('the event belongs to another mandate than the one signed')
+  const mandateId = typeof s.mandateId === 'string' ? s.mandateId : undefined
+  const projectId = typeof s.projectId === 'string' ? s.projectId : undefined
+  problems.push(...await checkMandateEvent(event, mandateId))
+  if (expect.projectId !== undefined && projectId !== expect.projectId) problems.push(`the receipt is for project ${String(s.projectId)}, not ${expect.projectId}`)
+  if (expect.mandateId !== undefined && mandateId !== expect.mandateId) problems.push(`the receipt is for mandate ${String(s.mandateId)}, not ${expect.mandateId}`)
+  return { problems, ...(projectId !== undefined ? { projectId } : {}), ...(mandateId !== undefined ? { mandateId } : {}), event }
+}
+
+async function checkMandateExport(pages: unknown, trust: MandateTrust): Promise<MandateExportCheck> {
+  const empty = (problems: string[]): MandateExportCheck => ({
+    valid: false, problems, notes: [], keyTrust: trust.keyTrust, projectId: '', mandateId: '',
+    events: 0, lastSeq: 0, checkpoints: 0, sealedThrough: 0, headChecked: false, complete: false,
+  })
+  const list = Array.isArray(pages) ? pages : [pages]
+  if (list.length === 0 || !list.every(pg => isJsonObject(pg) && Array.isArray(pg.events) && typeof pg.projectId === 'string' && typeof pg.mandateId === 'string')) {
+    return empty([...trust.problems, 'an export must be the pages returned by mandate.export(), in order: { projectId, mandateId, events, ... }'])
+  }
+  const exportPages = list as MandateExportPage[]
+  if (!exportPages.every(pg => pg.events.every(isMandateEventShape))) {
+    return empty([...trust.problems, 'the export holds an entry that is not an event'])
+  }
+
+  const problems = [...trust.problems]
+  const notes:    string[] = []
+  const { projectId, mandateId } = exportPages[0]
+  const events: MandateEvent[] = []
+  for (const pg of exportPages) {
+    if (pg.projectId !== projectId || pg.mandateId !== mandateId) problems.push('the pages are not all of the same mandate')
+    events.push(...pg.events)
+  }
+  if (events.length === 0) notes.push('the export holds no events')
+
+  // 1. the chain: every event follows the one before it, and is what it says it is
+  let prev = events[0]?.seq === 1 ? MANDATE_GENESIS_HASH : events[0]?.prevHash
+  if (events[0] && events[0].seq !== 1) notes.push(`the export starts at event ${events[0].seq}: the events before it are not checked`)
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i]
+    if (i > 0 && e.seq !== events[i - 1].seq + 1) problems.push(`event ${e.seq} does not follow event ${events[i - 1].seq}: events are missing`)
+    if (e.prevHash !== prev) problems.push(`event ${e.seq}: prevHash is not the hash of the event before it`)
+    problems.push(...await checkMandateEvent(e, mandateId))
+    prev = e.hash
+  }
+  const bySeq = new Map(events.map(e => [e.seq, e]))
+
+  // 2. the checkpoints: FIPSign's signature over an event in the middle of the chain
+  let sealedThrough = 0
+  let checkpoints   = 0
+  for (const e of events.filter(x => x.type === 'checkpoint')) {
+    let b: unknown
+    try { b = JSON.parse(e.body) } catch { continue }   // reported by checkMandateEvent
+    if (!isJsonObject(b)) continue
+    if (typeof b.coversSeq !== 'number' || typeof b.coversHash !== 'string') { problems.push(`checkpoint ${e.seq}: it is not well formed`); continue }
+    const covered = bySeq.get(b.coversSeq)
+    if (!covered) { notes.push(`checkpoint ${e.seq} covers event ${b.coversSeq}, which is not in this export`); continue }
+    if (covered.hash !== b.coversHash) { problems.push(`checkpoint ${e.seq}: the event ${b.coversSeq} is not the one FIPSign sealed (the history was changed)`); continue }
+    if (b.projectId !== projectId) { problems.push(`checkpoint ${e.seq}: it is for another project`); continue }
+    const signed = canonicalizeForSigning({ v: 1, kind: 'mandate.checkpoint', projectId, mandateId, seq: b.coversSeq, hash: b.coversHash, at: b.at })
+    const err = checkMandateSeal({ signed, signature: b.signature, algorithm: b.alg, keyFingerprint: b.keyFp }, trust.trusted)
+    if (err) { problems.push(`checkpoint ${e.seq}: ${err}`); continue }
+    checkpoints++
+    sealedThrough = Math.max(sealedThrough, b.coversSeq)
+  }
+
+  // 3. the signed head of the live chain, as it was when the export was made
+  let headChecked = false
+  const head = [...exportPages].reverse().find(pg => pg.head)?.head ?? null
+  if (head) {
+    const err    = checkMandateSeal(head as unknown as JsonObject, trust.trusted)
+    const parsed = parseMandateStatement(head.signed, 'mandate.export')
+    if (err) problems.push(`head: ${err}`)
+    else if ('error' in parsed) problems.push(`head: ${parsed.error}`)
+    else {
+      const s = parsed.statement
+      if (s.projectId !== projectId || s.mandateId !== mandateId || s.seq !== head.seq || s.hash !== head.hash || s.at !== head.at) {
+        problems.push('head: the signed statement is not about this mandate and this head')
+      }
+      const at = bySeq.get(head.seq)
+      if (!at) notes.push(`the signed head is event ${head.seq}, which is not in this export`)
+      else if (at.hash !== head.hash) problems.push(`head: the event ${head.seq} in the export is not the one FIPSign holds (the history was changed)`)
+      else headChecked = true
+    }
+  }
+
+  const lastSeq          = events[events.length - 1]?.seq ?? 0
+  const lastIsCheckpoint = events[events.length - 1]?.type === 'checkpoint'
+  const lastPage         = exportPages[exportPages.length - 1]
+  // The last page says there is nothing after it, but the signed head is further on: the end of the chain was cut off.
+  if (head && lastPage.nextAfter === null && head.seq > lastSeq) {
+    problems.push(`head: FIPSign holds events up to ${head.seq}, the export ends at ${lastSeq}: events are missing at the end`)
+  }
+  return {
+    valid: problems.length === 0, problems, notes, keyTrust: trust.keyTrust,
+    projectId, mandateId, events: events.length, lastSeq, checkpoints, sealedThrough, headChecked,
+    complete: events[0]?.seq === 1 && lastIsCheckpoint && sealedThrough === lastSeq - 1 && lastPage.nextAfter === null,
+  }
+}
+
+// What the pages of an export say about their keys: the candidates a pinned fingerprint can be found among.
+function exportKeyCandidates(pages: unknown): unknown[] {
+  return (Array.isArray(pages) ? pages : [pages]).flatMap(pg => (isJsonObject(pg) && Array.isArray(pg.publicKeys) ? pg.publicKeys : []))
+}
+
+// The two checks behind the public functions. `candidates` are the keys that come from FIPSign (mandate.publicKeys(), the pages of
+// an export); `fallback` says what happens when the caller gave neither `publicKey` nor `pinFingerprint`.
+async function runReceiptCheck(
+  receipt: unknown, options: MandateReceiptCheckOptions, candidates: unknown[], fallback: 'strict' | 'fipsign'
+): Promise<MandateReceiptCheck> {
+  let keyTrust: MandateKeyTrust = 'pinned'
+  try {
+    options = options ?? {}
+    const trust = await resolveMandateTrust(options, candidates, fallback)
+    keyTrust = trust.keyTrust
+    if (trust.trusted.size === 0) {
+      return { valid: false, keyTrust, problems: trust.problems.length > 0 ? trust.problems : ['there is no key to check the receipt with'] }
+    }
+    const found    = await checkMandateReceipt(receipt, trust.trusted, options.expect ?? {})
+    const problems = [...trust.problems, ...found.problems]
+    return {
+      valid: problems.length === 0, problems, keyTrust,
+      ...(found.projectId !== undefined ? { projectId: found.projectId } : {}),
+      ...(found.mandateId !== undefined ? { mandateId: found.mandateId } : {}),
+      ...(found.event     !== undefined ? { event:     found.event }     : {}),
+    }
+  } catch (err) {
+    return { valid: false, keyTrust, problems: [`the receipt could not be checked: ${err instanceof Error ? err.message : 'unknown error'}`] }
+  }
+}
+
+async function runExportCheck(
+  pages: unknown, options: MandateKeyOptions, fallback: 'strict' | 'fipsign'
+): Promise<MandateExportCheck> {
+  const failed = (keyTrust: MandateKeyTrust, problems: string[]): MandateExportCheck => ({
+    valid: false, problems, notes: [], keyTrust, projectId: '', mandateId: '',
+    events: 0, lastSeq: 0, checkpoints: 0, sealedThrough: 0, headChecked: false, complete: false,
+  })
+  let keyTrust: MandateKeyTrust = 'pinned'
+  try {
+    options = options ?? {}
+    const trust = await resolveMandateTrust(options, exportKeyCandidates(pages), fallback)
+    keyTrust = trust.keyTrust
+    if (trust.trusted.size === 0) {
+      return failed(keyTrust, trust.problems.length > 0 ? trust.problems : ['there is no key to check the export with'])
+    }
+    return await checkMandateExport(pages, trust)
+  } catch (err) {
+    return failed(keyTrust, [`the export could not be checked: ${err instanceof Error ? err.message : 'unknown error'}`])
+  }
+}
+
+/**
+ * Check a Mandate receipt on your own machine: the signature, the event it covers and its hash. Never throws and sends nothing
+ * anywhere: `valid` is true only if everything checks out, and `problems` says what did not.
+ *
+ * `receipt` is what mandate.emit(), the PATCH methods or mandate.verify(..., { receipt: true }) returned: the `receipt` field, or
+ * the whole answer. Keep the receipts you care about: each one commits to the whole history of the mandate up to its event, so
+ * the history cannot be rewritten later without the receipt showing it.
+ *
+ * Say which key to trust with `publicKey` (the key you saved) or with `pinFingerprint` (its fingerprint) together with `keys`
+ * (for example `(await pqauth.mandate.publicKeys()).keys`: it lists the keys the project had before a rotation too). A receipt
+ * made with a key you did not give fails. Without either, nothing is trusted and the check fails: mandate.verifyReceipt() checks
+ * against the keys FIPSign lists when you give nothing.
+ *
+ * @example
+ * const { receipt } = await pqauth.mandate.suspend(id, { correlationId: 'ticket-4821' })
+ * // later, wherever you keep it:
+ * const check = await verifyMandateReceipt(receipt, { publicKey: SAVED_PUBLIC_KEY })
+ * if (!check.valid) console.error(check.problems)
+ */
+export function verifyMandateReceipt(receipt: unknown, options: MandateReceiptCheckOptions = {}): Promise<MandateReceiptCheck> {
+  return runReceiptCheck(receipt, options, [], 'strict')
+}
+
+/**
+ * Check the audit log of a mandate, as mandate.exportAll() returns it, on your own machine: every event follows the one before
+ * it and is what it says it is; the checkpoints (FIPSign's signature over an event in the middle of the chain) and the signed
+ * head of the log verify; and no event was left out or changed. Never throws and sends nothing anywhere.
+ *
+ * `pages` are the pages of the export, in order (one page, or an array). Say which key to trust with `publicKey` or with
+ * `pinFingerprint`: the keys then come from the export itself (`publicKeys`: it lists the keys the project had before a
+ * rotation too) and a key is accepted only if its own fingerprint is the one you pinned. Without either, nothing is trusted and
+ * the check fails: mandate.verifyExport() checks against the keys of the export when you give nothing.
+ *
+ * `complete` says whether the log starts at event 1 and ends in a checkpoint that seals everything before it. A log that is
+ * `valid` but not `complete` has events at its end that only the signed head (or a receipt you hold) protects.
+ *
+ * @example
+ * const pages = await pqauth.mandate.exportAll(id)
+ * const check = await verifyMandateExport(pages, { pinFingerprint: SAVED_FINGERPRINT })
+ * if (!check.valid) console.error(check.problems)
+ */
+export function verifyMandateExport(pages: unknown, options: MandateKeyOptions = {}): Promise<MandateExportCheck> {
+  return runExportCheck(pages, options, 'strict')
 }
 
 // ─── PQAuth client ────────────────────────────────────────────────────────────
@@ -1599,7 +2223,12 @@ getCrl: async (): Promise<CaGetCrlResult> => {
           method:  'POST',
           signal:  controller.signal,
           headers: { 'Content-Type': 'application/json', 'X-API-Key': this.apiKey },
-          body:    JSON.stringify({ token, action, cost, ...(options?.agentSignature ? { agentSignature: options.agentSignature } : {}) }),
+          body:    JSON.stringify({
+            token, action, cost,
+            ...(options?.agentSignature ? { agentSignature: options.agentSignature } : {}),
+            ...(options?.receipt === true ? { receipt: true } : {}),
+            ...(options?.correlationId !== undefined ? { correlationId: options.correlationId } : {}),
+          }),
         })
         status     = res.status
         retryAfter = parseRetryAfter(res.headers?.get?.('Retry-After'))
@@ -1646,31 +2275,31 @@ getCrl: async (): Promise<CaGetCrlResult> => {
      * scope. Monotonic — cannot be reversed, and cannot re-widen toward
      * the original scope. To restore scope, emit a new mandate.
      */
-    narrow: (mandateId: string, scope: string[]): Promise<MandatePatchResult> =>
+    narrow: (mandateId: string, scope: string[], options?: MandateChangeOptions): Promise<MandatePatchResult> =>
       this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
-        body:   JSON.stringify({ action: 'narrow', scope }),
+        body:   JSON.stringify({ action: 'narrow', scope, ...changeFields(options) }),
       }),
 
     /** Temporarily pause a mandate. verify() will deny while suspended. */
-    suspend: (mandateId: string): Promise<MandatePatchResult> =>
+    suspend: (mandateId: string, options?: MandateChangeOptions): Promise<MandatePatchResult> =>
       this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
-        body:   JSON.stringify({ action: 'suspend' }),
+        body:   JSON.stringify({ action: 'suspend', ...changeFields(options) }),
       }),
 
     /** Reactivate a suspended mandate. */
-    resume: (mandateId: string): Promise<MandatePatchResult> =>
+    resume: (mandateId: string, options?: MandateChangeOptions): Promise<MandatePatchResult> =>
       this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
-        body:   JSON.stringify({ action: 'resume' }),
+        body:   JSON.stringify({ action: 'resume', ...changeFields(options) }),
       }),
 
     /** Permanently terminate a mandate. Irreversible. */
-    revoke: (mandateId: string): Promise<MandatePatchResult> =>
+    revoke: (mandateId: string, options?: MandateChangeOptions): Promise<MandatePatchResult> =>
       this.request<MandatePatchResult>(`/mandate/${encodeURIComponent(mandateId)}`, {
         method: 'PATCH',
-        body:   JSON.stringify({ action: 'revoke' }),
+        body:   JSON.stringify({ action: 'revoke', ...changeFields(options) }),
       }),
 
     /** Get a mandate's current state by id. Free — no token cost. */
@@ -1700,6 +2329,163 @@ getCrl: async (): Promise<CaGetCrlResult> => {
      */
     listAll: (options?: { limit?: number }): AsyncGenerator<Mandate, void, undefined> =>
       this.iterateMandates(options?.limit),
+
+    // ── audit: events, export, receipts ────────────────────────────────────────
+    // Everything FIPSign records about a mandate (who emitted it, every call it granted or denied, every change) is kept as a
+    // chain of events, and FIPSign signs what it records. These calls read that log; they need the API key of the project (an
+    // agent key cannot read it), cost no platform tokens and count against the read rate limit of mandate.list().
+
+    /**
+     * One page of the audit log of a mandate, oldest event first. Free — no token cost.
+     *
+     * Events are numbered from 1 (`seq`) and chained: each one carries the hash of the one before it. Page with `after` (the
+     * `nextAfter` of the previous page) or use eventsAll(). An event shows up here a few seconds after it happened.
+     *
+     * @example
+     * const { events, head } = await pqauth.mandate.events(mandate.id)
+     * for (const e of events) console.log(e.seq, e.type, JSON.parse(e.body))
+     */
+    events: (mandateId: string, options?: MandateEventsOptions): Promise<MandateEventsResult> => {
+      const params = new URLSearchParams()
+      if (options?.after !== undefined) params.set('after', String(options.after))
+      if (options?.limit !== undefined) params.set('limit', String(options.limit))
+      const query = params.toString()
+      return this.request<MandateEventsResult>(`/mandate/${encodeURIComponent(mandateId)}/events${query ? `?${query}` : ''}`)
+    },
+
+    /**
+     * Iterate over every event of a mandate, oldest first, following nextAfter page by page. Free — no token cost.
+     * Stop early with `break`: no further page is requested.
+     *
+     * @example
+     * for await (const e of pqauth.mandate.eventsAll(mandate.id)) console.log(e.seq, e.type)
+     */
+    eventsAll: (mandateId: string, options?: { limit?: number }): AsyncGenerator<MandateEvent, void, undefined> =>
+      this.iterateMandateEvents(mandateId, options?.limit),
+
+    /**
+     * Search the events of ALL the mandates of the project, newest first: by mandate, type, action, API key, `correlationId`,
+     * the trace id of a W3C `traceparent` header, and period. Free — no token cost.
+     *
+     * Without `mandateId`, `correlationId` or `traceId` the period is the last 7 days unless you give `from`, and it may span at
+     * most 90 days. Page with `cursor` (the `nextCursor` of the previous page, as received) or use queryEventsAll().
+     *
+     * @example — everything that happened under one of your own ids
+     * const { events } = await pqauth.mandate.queryEvents({ correlationId: 'ticket-4821' })
+     * @example — every denied call of the last day
+     * const { events } = await pqauth.mandate.queryEvents({ type: 'verify_denied', from: Math.floor(Date.now() / 1000) - 86_400 })
+     */
+    queryEvents: (query?: MandateEventsQuery): Promise<MandateEventsQueryResult> => {
+      const text = eventsQueryString(query)
+      return this.request<MandateEventsQueryResult>(text ? `/mandate/events?${text}` : '/mandate/events')
+    },
+
+    /**
+     * Iterate over every event that matches the query, newest first, following nextCursor page by page. Free — no token cost.
+     *
+     * @example
+     * for await (const e of pqauth.mandate.queryEventsAll({ type: 'verify_denied' })) console.log(e.mandateId, e.at)
+     */
+    queryEventsAll: (query?: MandateEventsQuery): AsyncGenerator<MandateProjectEvent, void, undefined> =>
+      this.iterateMandateEventsQuery(query),
+
+    /**
+     * One page of the export of a mandate: its events plus FIPSign's signature over the end of the chain at this moment (`head`)
+     * and the public keys of the project (`publicKeys`, the retired ones too). Free — no token cost.
+     *
+     * Use exportAll() to get every page, and verifyMandateExport() (or mandate.verifyExport()) to check them.
+     */
+    export: (mandateId: string, options?: MandateExportOptions): Promise<MandateExportPage> => {
+      const params = new URLSearchParams()
+      if (options?.after !== undefined) params.set('after', String(options.after))
+      if (options?.limit !== undefined) params.set('limit', String(options.limit))
+      const query = params.toString()
+      return this.request<MandateExportPage>(`/mandate/${encodeURIComponent(mandateId)}/export${query ? `?${query}` : ''}`)
+    },
+
+    /**
+     * Every page of the export of a mandate, in order, ready for verifyMandateExport(). Free — no token cost.
+     *
+     * @example — keep the export and check it on your own machine
+     * const pages = await pqauth.mandate.exportAll(mandate.id)
+     * const check = await verifyMandateExport(pages, { pinFingerprint: SAVED_FINGERPRINT })
+     * if (!check.valid) console.error(check.problems)
+     */
+    exportAll: (mandateId: string, options?: { limit?: number }): Promise<MandateExportPage[]> =>
+      this.collectMandateExport(mandateId, options?.limit),
+
+    /**
+     * Every public key this project has signed with: the current one first, then the retired ones. A receipt is checked with
+     * the key that made it, so after a key rotation the old key is still needed. Free — no token cost.
+     *
+     * The list comes from FIPSign: to be sure a key is yours, compare its fingerprint with the one you saved
+     * (publicKeyFingerprint()), or pass `pinFingerprint` to verifyMandateReceipt() / verifyMandateExport().
+     */
+    publicKeys: (): Promise<MandatePublicKeysResult> =>
+      this.request<MandatePublicKeysResult>('/public-keys'),
+
+    /**
+     * Check a receipt (see MandateReceipt) on your own machine. Same as verifyMandateReceipt(), with one difference: when you
+     * give neither `publicKey` nor `pinFingerprint`, it checks with the keys FIPSign lists (`keys` if you pass them, otherwise
+     * mandate.publicKeys()) and says `keyTrust: 'fipsign'`. That detects a receipt or a log that was altered; it cannot tell a
+     * key that FIPSign itself replaced. Give `publicKey` or `pinFingerprint` and the answer says `keyTrust: 'pinned'`.
+     *
+     * Throws a PQAuthError only if it has to fetch the keys and cannot. Whatever is wrong with the receipt is in `problems`.
+     *
+     * @example
+     * const { receipt } = await pqauth.mandate.revoke(id, { correlationId: 'ticket-4821' })
+     * const check = await pqauth.mandate.verifyReceipt(receipt, { pinFingerprint: SAVED_FINGERPRINT })
+     * if (!check.valid) console.error(check.problems)
+     */
+    verifyReceipt: async (receipt: unknown, options: MandateReceiptCheckOptions = {}): Promise<MandateReceiptCheck> => {
+      const onlyPublicKey = toList<unknown>(options.publicKey).length > 0 && toList<unknown>(options.pinFingerprint).length === 0
+      const listed = options.keys === undefined && !onlyPublicKey ? (await this.mandate.publicKeys()).keys : []
+      return runReceiptCheck(receipt, options, listed, 'fipsign')
+    },
+
+    /**
+     * Check the pages of an export (see exportAll()) on your own machine. Same as verifyMandateExport(), with one difference:
+     * when you give neither `publicKey` nor `pinFingerprint`, it checks with the keys the export itself carries and says
+     * `keyTrust: 'fipsign'` (see verifyReceipt()). Makes no request.
+     */
+    verifyExport: (pages: unknown, options: MandateKeyOptions = {}): Promise<MandateExportCheck> =>
+      runExportCheck(pages, options, 'fipsign'),
+  }
+  // Follows nextAfter until it is null. The loop is driven by the pagination field, never by the page size.
+  private async *iterateMandateEvents(mandateId: string, limit?: number): AsyncGenerator<MandateEvent, void, undefined> {
+    let after = 0
+    for (;;) {
+      const page = await this.mandate.events(mandateId, { after, ...(limit !== undefined ? { limit } : {}) })
+      for (const e of page.events) yield e
+      if (page.nextAfter === null) return
+      if (page.nextAfter <= after) throw new PQAuthError('Pagination did not advance', 'API_ERROR')
+      after = page.nextAfter
+    }
+  }
+
+  // Follows nextCursor until it is null.
+  private async *iterateMandateEventsQuery(query: MandateEventsQuery | undefined): AsyncGenerator<MandateProjectEvent, void, undefined> {
+    let cursor = query?.cursor
+    for (;;) {
+      const page = await this.mandate.queryEvents({ ...(query ?? {}), ...(cursor !== undefined ? { cursor } : {}) })
+      for (const e of page.events) yield e
+      if (page.nextCursor === null) return
+      if (page.nextCursor === cursor) throw new PQAuthError('Pagination cursor did not advance', 'API_ERROR')
+      cursor = page.nextCursor
+    }
+  }
+
+  // Every page of an export, in order.
+  private async collectMandateExport(mandateId: string, limit?: number): Promise<MandateExportPage[]> {
+    const pages: MandateExportPage[] = []
+    let after = 0
+    for (;;) {
+      const page = await this.mandate.export(mandateId, { after, ...(limit !== undefined ? { limit } : {}) })
+      pages.push(page)
+      if (page.nextAfter === null) return pages
+      if (page.nextAfter <= after) throw new PQAuthError('Pagination did not advance', 'API_ERROR')
+      after = page.nextAfter
+    }
   }
 
   // Follows nextCursor until it is null. A page can be short or empty while more pages exist, so the
